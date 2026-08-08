@@ -475,26 +475,17 @@ pytest tests/simulation/ -v
 
 ## 📦 Deployment
 
-### Docker
+### Docker Compose (what's actually tested)
+
+Meridian runs as five services: `backend` (FastAPI), `worker` (Celery),
+`postgres`, `redis`, and `dashboard`.
 
 ```bash
-docker build -t meridian:latest .
-docker run -p 8000:8000 meridian:latest
+docker compose up -d
 ```
 
-### Railway (Recommended for startups)
-
-```bash
-railway up
-```
-
-### AWS EC2 + Docker
-
-```bash
-aws ec2 run-instances --image-id ami-... --instance-type t3.medium
-docker pull meridian:latest
-docker run -e MERIDIAN_API_KEY=$API_KEY meridian:latest
-```
+Cloud hosting (Railway, AWS, Fly.io, etc.) hasn't been set up yet — this
+project currently runs locally via Docker Compose only.
 
 ---
 
@@ -511,23 +502,28 @@ docker run -e MERIDIAN_API_KEY=$API_KEY meridian:latest
 
 ## 📊 Performance Benchmarks
 
-Tested against standard LLM workloads:
+Real numbers from a local load test (Locust, 20 concurrent users, 45s, Anthropic
+calls mocked so this isolates Meridian's own routing/truncation/caching/DB
+overhead — not Claude's response time):
 
 ```
-Request Type        | Avg Cost Reduction | Quality Loss | Latency Overhead
-─────────────────────────────────────────────────────────────────────────
-Email Classification|     93%            | 0.1%         | +50ms
-Text Summarization  |     42%            | 0.5%         | +120ms
-Code Generation     |     15%            | 1.2%         | +180ms
-Document QA (RAG)   |     38%            | 0.3%         | +85ms
-─────────────────────────────────────────────────────────────────────────
+692 requests, 0 failures, ~15.5 req/s aggregate
 
-Benchmarks run on:
-- 100 requests per workload type
-- AWS t3.large instance
-- Redis cache enabled
-- Batch processing enabled
+Endpoint                        p50    p95    p99
+─────────────────────────────────────────────────
+POST /api/messages              18ms   52ms   86ms
+POST /api/messages (long ctx)   20ms   35ms   76ms
+GET  /api/estimate               5ms   21ms   68ms
+GET  /api/dashboard/summary     11ms   73ms  200ms
+─────────────────────────────────────────────────
+Aggregate                       17ms   42ms   86ms
 ```
+
+Cost-reduction percentages (90-95% in tested scenarios) are documented from
+live runs, not this benchmark — see the optimization examples above.
+Quality-loss numbers per task type aren't included here: that requires a
+real evaluation pipeline (comparing actual model outputs against a golden
+set), which doesn't exist yet — see the Roadmap section below.
 
 ---
 
@@ -566,7 +562,7 @@ MIT License — See [LICENSE](LICENSE) file
 - **Issues:** [GitHub Issues](https://github.com/rey-reypixel/meridian/issues)
 - **Discussions:** [GitHub Discussions](https://github.com/rey-reypixel/meridian/discussions)
 - **Email:** mahashreyaa@gmail.com
-- **X/Twitter:** [@rey_reypixel](https://twitter.com/rey_reypixel)
+- **Discord:** doodle_is_glitched
 
 ---
 
@@ -574,16 +570,18 @@ MIT License — See [LICENSE](LICENSE) file
 
 - FastEmbed team for lightweight embeddings
 - Anthropic for Claude API
-- OpenAI for GPT models
 - FastAPI community for the excellent framework
 
 ---
 
 ## 📈 Roadmap
 
-- **v2.0** (Q2 2025): Multi-provider fine-tuning integration
-- **v2.5** (Q3 2025): ML-based quality predictor
-- **v3.0** (Q4 2025): Self-optimizing routing (learns from historical data)
+Not on a committed timeline — these are the directions being considered, not scheduled releases:
+
+- Multi-provider support (OpenAI, others)
+- ML-based quality evaluation (replacing the current hand-set quality scores with measured data)
+- Real Anthropic Batch API integration (current batching groups requests but doesn't yet get the batch-API discount)
+- Self-optimizing routing that learns from historical outcomes
 
 ---
 
