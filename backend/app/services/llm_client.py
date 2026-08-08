@@ -1,6 +1,7 @@
 import anthropic
 from typing import List, Dict, Any
 from app.config import settings
+from app.services.cost_predictor import cost_predictor
 import uuid
 
 
@@ -10,6 +11,23 @@ class OptimizedLLMClient:
     def __init__(self):
         self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
+    def _mock_call(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        """Dev/test-only fake completion - see settings.mock_anthropic"""
+        input_text = "\n".join(m.get("content", "") for m in messages)
+        content = f"[MOCK RESPONSE] Simulated {model} completion for {len(messages)} message(s)."
+        return {
+            "content": content,
+            "stop_reason": "end_turn",
+            "input_tokens": cost_predictor.count_tokens(input_text),
+            "output_tokens": min(cost_predictor.count_tokens(content), max_tokens),
+            "request_id": str(uuid.uuid4())
+        }
+
     def _call(
         self,
         model: str,
@@ -18,6 +36,9 @@ class OptimizedLLMClient:
         temperature: float,
         system: str,
     ) -> Dict[str, Any]:
+        if settings.mock_anthropic:
+            return self._mock_call(model, messages, max_tokens)
+
         try:
             response = self.client.messages.create(
                 model=model,

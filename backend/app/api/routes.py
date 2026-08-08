@@ -52,9 +52,9 @@ async def create_message(
         routed_model = request.model
         quality_score = 9.0
 
-        # Context truncation
+        # Context truncation (skipped in "speed" mode - computing embeddings adds latency)
         truncated_messages = messages
-        if settings.context_truncation_enabled:
+        if settings.context_truncation_enabled and request.optimize_for != "speed":
             truncated_messages = context_truncation.truncate_context(
                 messages,
                 relevance_threshold=settings.context_relevance_threshold,
@@ -63,9 +63,11 @@ async def create_message(
             if len(truncated_messages) < len(messages):
                 optimizations_applied.append("context_truncation")
 
-        # Model routing
-        if settings.model_routing_enabled and len(optimizations_applied) > 0:
-            routing_decision = model_router.get_routing_decision(request.model, prompt_text)
+        # Model routing (skipped in "quality" mode - never downgrade below the requested model)
+        if settings.model_routing_enabled and request.optimize_for != "quality":
+            routing_decision = model_router.get_routing_decision(
+                request.model, prompt_text, quality_threshold=request.quality_threshold
+            )
             routed_model = routing_decision["routed_model"]
             quality_score = routing_decision["quality_score"]
             if routing_decision["was_routed"]:
@@ -80,6 +82,16 @@ async def create_message(
         )
         optimized_cost = optimized_estimate["estimated_cost"]
         savings = max(0, original_cost - optimized_cost)
+
+        # Enforce a per-request budget, if given, before spending anything
+        if request.cost_limit is not None and optimized_cost > request.cost_limit:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=(
+                    f"Estimated cost ${optimized_cost:.6f} exceeds "
+                    f"cost_limit ${request.cost_limit:.6f}"
+                )
+            )
 
         # Call Claude API (direct, or grouped through the batch queue)
         if request.batch and settings.batch_processing_enabled:

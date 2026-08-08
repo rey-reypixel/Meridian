@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 
 
@@ -32,10 +32,10 @@ class MessagesCreateRequest(BaseModel):
     messages: List[MessageInput]
     max_tokens: int = 1024
     temperature: float = 0.7
-    optimize_for: str = "cost"  # "cost", "speed", "quality"
+    optimize_for: Literal["cost", "speed", "quality"] = "cost"
     cost_limit: Optional[float] = None
     batch: bool = False
-    quality_threshold: float = 0.9
+    quality_threshold: float = 8.5  # 0-10 scale, matches ModelRouter.QUALITY_SCORES
 
 
 class MessageResponse(BaseModel):

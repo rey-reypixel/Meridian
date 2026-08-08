@@ -67,7 +67,7 @@ class ModelRouter:
         if not self.enabled:
             return original_model, self.get_quality_score(original_model, "general")
 
-        quality_threshold = quality_threshold or self.quality_threshold
+        quality_threshold = quality_threshold if quality_threshold is not None else self.quality_threshold
         task_type = self.classify_task(prompt)
 
         # Find cheapest model meeting quality threshold
@@ -83,9 +83,14 @@ class ModelRouter:
         """Get quality score for task/model combination"""
         return self.QUALITY_SCORES.get((task_type, model), 7.0)
 
-    def get_routing_decision(self, original_model: str, prompt: str) -> Dict[str, any]:
+    def get_routing_decision(
+        self,
+        original_model: str,
+        prompt: str,
+        quality_threshold: Optional[float] = None
+    ) -> Dict[str, any]:
         """Get full routing decision info"""
-        selected_model, quality_score = self.select_model(original_model, prompt)
+        selected_model, quality_score = self.select_model(original_model, prompt, quality_threshold)
         task_type = self.classify_task(prompt)
 
         return {

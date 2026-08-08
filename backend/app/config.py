@@ -19,6 +19,12 @@ class Settings(BaseSettings):
 
     # Anthropic API
     anthropic_api_key: str = ""
+    # Dev/test-only: skip the real Anthropic call, return a deterministic
+    # fake completion instead. Token counts are still computed for real via
+    # tiktoken on whatever the pipeline actually sends, so cost/routing/
+    # truncation math stays honest - only the completion text is fake.
+    # Never enable this in production.
+    mock_anthropic: bool = False
 
     # OAuth (Google)
     google_client_id: str = ""
@@ -32,7 +38,7 @@ class Settings(BaseSettings):
     context_truncation_enabled: bool = True
     model_routing_enabled: bool = True
     batch_processing_enabled: bool = True
-    quality_threshold: float = 0.9
+    quality_threshold: float = 8.5  # 0-10 scale, matches ModelRouter.QUALITY_SCORES
     context_relevance_threshold: float = 0.7
     preserve_recent_messages: int = 5
 

@@ -76,3 +76,13 @@ class TestModelRouter:
         # For classification with threshold 8.0, should pick cheapest (haiku has 8.5)
         if score >= 8.0:
             assert model in ["claude-haiku", "claude-sonnet", "claude-opus"]
+
+    def test_get_routing_decision_quality_threshold_changes_model(self):
+        """get_routing_decision's quality_threshold param should actually reach select_model"""
+        prompt = "Classify this email"  # classification: haiku=8.5, sonnet=9.2, opus=9.5
+
+        loose = model_router.get_routing_decision("claude-opus", prompt, quality_threshold=8.0)
+        assert loose["routed_model"] == "claude-haiku"
+
+        strict = model_router.get_routing_decision("claude-opus", prompt, quality_threshold=9.3)
+        assert strict["routed_model"] == "claude-opus"

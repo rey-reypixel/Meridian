@@ -267,3 +267,218 @@ working against real infrastructure, not mocks.
 
 Postgres/Redis/backend/worker were left running after this test (not torn
 down) in case further live testing is wanted.
+
+
+======================================================
+PHASE 2.5 — found while wiring up 3 previously-dead request params
+======================================================
+Date: 2026-08-08 (same day, continued)
+Context: Before testing against a real Anthropic API key, checked whether
+MessagesCreateRequest's advertised parameters (cost_limit, optimize_for,
+quality_threshold) actually did anything. They didn't — 3 of 8 request
+fields were accepted and silently ignored. Fixing all 3 surfaced two more
+real bugs along the way.
+
+BUG 6 — cost_limit accepted but never enforced
+--------------------------------------------------------------------------
+File:     app/api/routes.py (create_message)
+Symptom:  A caller could pass cost_limit=0.50 ("don't spend more than
+          this") and it did nothing — request always went through
+          regardless of estimated cost. Directly contradicts the README's
+          advertised budgeting feature.
+Cause:    request.cost_limit was never read anywhere in the function.
+Fix:      After computing optimized_cost (the pre-call estimate) and
+          before any LLM/batch call, added:
+            if request.cost_limit is not None and optimized_cost > request.cost_limit:
+                raise HTTPException(402, detail=f"Estimated cost ... exceeds cost_limit ...")
+          Placed before the Claude API call specifically so a request that
+          would exceed budget never spends anything.
+Test:     tests/test_routes.py::test_create_message_cost_limit_rejects_when_exceeded
+          asserts 402 + mock_llm.assert_not_called().
+
+
+BUG 7 — optimize_for accepted but never branched anything
+--------------------------------------------------------------------------
+File:     app/api/routes.py, app/db/schemas.py
+Symptom:  optimize_for="quality" or "speed" behaved identically to the
+          "cost" default — always ran the same truncation+routing
+          pipeline no matter what the caller asked for. Also, the field
+          was a bare `str`, so a typo like "qualtiy" silently fell through
+          to default behavior instead of erroring.
+Cause:    request.optimize_for was never read in create_message.
+Fix:      - Context truncation now skipped when optimize_for == "speed"
+            (computing embeddings adds latency, which is what "speed" mode
+            is presumably asking to avoid).
+          - Model routing now skipped when optimize_for == "quality" (never
+            downgrade below the model the caller actually asked for).
+          - Changed the schema field from `str` to
+            `Literal["cost", "speed", "quality"]` so FastAPI now returns a
+            422 for any other value instead of silently misinterpreting it.
+Test:     test_create_message_optimize_for_quality_skips_routing,
+          test_create_message_optimize_for_speed_skips_truncation,
+          test_create_message_invalid_optimize_for_rejected.
+
+
+BUG 8 — quality_threshold accepted but ignored (used the global default instead)
+--------------------------------------------------------------------------
+File:     app/api/routes.py, app/services/model_router.py
+Symptom:  A caller passing a custom quality_threshold per request had no
+          effect — routing always used settings.quality_threshold instead.
+Cause:    ModelRouter.get_routing_decision() didn't even accept a
+          quality_threshold parameter, so routes.py had nothing to pass
+          through even if it wanted to.
+Fix:      Added quality_threshold: Optional[float] = None to
+          get_routing_decision(), forwarded to select_model(). routes.py
+          now calls
+            model_router.get_routing_decision(request.model, prompt_text, quality_threshold=request.quality_threshold)
+Test:     test_get_routing_decision_quality_threshold_changes_model (proves
+          a loose threshold picks haiku, a strict one picks opus, for the
+          same prompt).
+
+
+BUG 9 (found while fixing #8) — model routing accidentally gated behind
+context truncation having fired
+--------------------------------------------------------------------------
+File:     app/api/routes.py
+Symptom:  Model routing only ran `if settings.model_routing_enabled and
+          len(optimizations_applied) > 0` — i.e. it silently never ran
+          unless context truncation had already dropped at least one
+          message. A short conversation (<= preserve_recent_messages)
+          would never trigger truncation, so routing was skipped too, even
+          though the two optimizations are logically independent. This
+          would have made the "model routing" test scenario show nothing
+          for any short prompt.
+Cause:    Leftover/accidental coupling — `len(optimizations_applied) > 0`
+          was presumably meant as some other condition and never revisited.
+Fix:      Changed the gate to just `if settings.model_routing_enabled and
+          request.optimize_for != "quality"` (see Bug 7) - routing now
+          runs independently of whether truncation fired.
+
+
+BUG 10 (found while fixing #8) — quality_threshold default on the wrong
+scale, made routing always pick the cheapest model
+--------------------------------------------------------------------------
+File:     app/config.py, app/db/schemas.py
+Symptom:  ModelRouter.QUALITY_SCORES are all 0-10 scale values (7.0-9.6).
+          Both Settings.quality_threshold and
+          MessagesCreateRequest.quality_threshold defaulted to `0.9` — a
+          0-1 style number. Since every real quality score is >7x that
+          threshold, EVERY task for EVERY model trivially passed the
+          check, so select_model always returned the first (cheapest)
+          entry in MODEL_ORDER: claude-haiku, regardless of task
+          complexity. The core "intelligent routing" feature was
+          non-functional by default - it always just picked Haiku.
+Cause:    Default value copy-pasted from the README's example
+          (`quality_threshold: float = 0.9  # Min acceptable quality`,
+          written as if 0-1 normalized) without reconciling it against the
+          actual 0-10 QUALITY_SCORES table used internally.
+Fix:      Changed both defaults from 0.9 to 8.5 (0-10 scale). At 8.5:
+          classification->haiku, summarization/coding->sonnet,
+          general->sonnet - a meaningfully varied routing outcome across
+          task types, instead of always Haiku.
+
+
+MINOR — falsy-vs-None bug in select_model's threshold override
+--------------------------------------------------------------------------
+File:     app/services/model_router.py
+Issue:    `quality_threshold = quality_threshold or self.quality_threshold`
+          would incorrectly override an explicit `quality_threshold=0.0`
+          with the instance default, since 0.0 is falsy. Same class of bug
+          as Bug 5 (Phase 1) and the Phase 2 context_truncation rewrite
+          already avoided. Not currently reachable with real values (0.0
+          isn't a sane threshold on the 0-10 scale) but fixed for
+          consistency: `quality_threshold if quality_threshold is not None
+          else self.quality_threshold`.
+
+
+TESTS
+-----
+53/53 pytest passed after these fixes (up from 48):
+  + test_create_message_cost_limit_rejects_when_exceeded
+  + test_create_message_optimize_for_quality_skips_routing
+  + test_create_message_optimize_for_speed_skips_truncation
+  + test_create_message_invalid_optimize_for_rejected
+  + test_get_routing_decision_quality_threshold_changes_model
+
+
+ALSO CAUGHT — .env had the same stale 0.9 value the code default just got
+fixed away from
+--------------------------------------------------------------------------
+File:     backend/.env
+Issue:    Bug 10 above fixed Settings.quality_threshold's default from 0.9
+          to 8.5 in config.py, but backend/.env explicitly set
+          QUALITY_THRESHOLD=0.9 - and env vars win over class defaults in
+          pydantic-settings. Left as-is, the .env value would have silently
+          un-done the Bug 10 fix for every real run (the code default is
+          only relevant when no env var is set).
+Fix:      Updated QUALITY_THRESHOLD=0.9 -> 8.5 in both backend/.env and
+          backend/.env.example.
+
+
+======================================================
+ADDED — MOCK_ANTHROPIC dev/test toggle
+======================================================
+Date: 2026-08-08 (same day, continued)
+Context: Wanted to verify the fixes above (and the whole Phase 2 pipeline)
+against the real live HTTP server rather than just pytest, but no paid
+Anthropic API key was available. Anthropic's API has no free tier for
+real usage, so added a settings.mock_anthropic flag (app/config.py) that
+OptimizedLLMClient._call checks (app/services/llm_client.py): when true,
+skips the real anthropic.Anthropic call and returns a clearly-labeled
+"[MOCK RESPONSE] ..." string instead - but still computes input/output
+token counts for real via cost_predictor.count_tokens() on whatever text
+the pipeline actually decided to send, so cost/truncation/routing math
+stays fully honest and only the completion text itself is fake.
+Not a bug fix - a deliberate, clearly-documented, off-by-default (in
+.env.example) dev-only escape hatch. Set MOCK_ANTHROPIC=true in the local
+backend/.env for this testing session only.
+
+LIVE VERIFICATION (real HTTP, real Postgres/Redis/Celery, mocked LLM call,
+$0 cost) - fresh test user, all 5 promised scenarios run against the
+actual running server:
+
+1. Direct call, "What is the capital of France?", requested claude-opus:
+   -> routed to claude-sonnet (general task: haiku=7.5 < 8.5 threshold
+      fails, sonnet=8.5 meets it). optimizations_applied=["model_routing"].
+      cost $0.000306 vs original $0.003855 - confirms Bug 9 (routing no
+      longer gated behind truncation) and Bug 10 (threshold scale) both
+      fixed, live, not just in pytest.
+
+2. Context truncation, the same 7-message France/cake conversation used
+   in the earlier FastEmbed test: mock received "5 message(s)" (down from
+   7) - matches the earlier direct-service-call result exactly.
+   optimizations_applied=["context_truncation","model_routing"].
+
+3. Model routing, classification prompt ("Classify this email as spam..."),
+   requested opus:
+     default (optimize_for=cost) -> routed to claude-haiku (classification:
+       haiku=8.5 meets the 8.5 threshold exactly), $0.001637 saved.
+     optimize_for=quality -> stayed on claude-opus, optimizations_applied
+       is empty, quality_score falls back to the pre-routing default (9.0)
+       since routing was skipped entirely - confirms Bug 7's fix works.
+
+4. Batch processing, batch:true, "Summarize this: cats are great pets"
+   (haiku requested): took the 15s inline-fallback path (nothing else
+   arrived to fill the batch - expected, matches the documented Phase 2
+   design gap re: no Celery beat). Routed haiku->sonnet (summarization
+   needs 9.0, haiku only scores 8.0 there) - note this is a quality
+   *upgrade*, not a downgrade, and the response correctly reports
+   savings=0 rather than a negative number, since optimized_cost ended up
+   higher than the original haiku-based estimate.
+   optimizations_applied=["model_routing","batch_processing"].
+
+5. Dashboard check after the above: GET /api/dashboard/summary and
+   /api/dashboard/models both reflect real aggregated numbers across every
+   request made this session (6 total, including a couple of earlier
+   attempts) - requests_optimized=6, savings_percentage=78.86%,
+   avg_quality_score=8.75, per-model breakdown correctly split across
+   haiku/sonnet/opus usage counts.
+
+MINOR OBSERVATION (not fixed, noted only) - dashboard total_cost rounds to
+$0.00 per model in the aggregate breakdown when every request costs a
+fraction of a cent (our test-scale amounts). avg_cost_per_request in the
+same response still shows full precision, so no data is actually lost -
+it's just that round(total_cost, 2) isn't granular enough to show a
+sub-cent aggregate. Not worth fixing at toy test scale; real usage
+volumes would accumulate past $0.01 quickly and this wouldn't be visible
+in practice.
