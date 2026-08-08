@@ -4,13 +4,13 @@ from sqlalchemy import func, and_
 import uuid
 import time
 from app.config import settings
-from app.db import get_db_session, models
+from app.db import models
 from app.db.schemas import (
     MessagesCreateRequest, MessagesCreateResponse, MessageResponse,
     CostEstimate, CostEstimateResponse, DashboardSummary, DashboardModels,
     ModelCostBreakdown, RequestDetail
 )
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, get_db
 from app.services.cost_predictor import cost_predictor
 from app.services.llm_client import llm_client
 from app.services.model_router import model_router
@@ -27,7 +27,7 @@ router = APIRouter(prefix="/api", tags=["messages"])
 async def create_message(
     request: MessagesCreateRequest,
     current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db)
 ):
     """Create a message with automatic optimization"""
     start_time = time.time()
@@ -174,7 +174,7 @@ async def estimate_cost(
 @router.get("/dashboard/summary", response_model=DashboardSummary)
 async def get_dashboard_summary(
     current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db)
 ):
     """Get dashboard summary for current user"""
     try:
@@ -219,7 +219,7 @@ async def get_dashboard_summary(
 @router.get("/dashboard/models", response_model=DashboardModels)
 async def get_dashboard_models(
     current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db)
 ):
     """Get cost breakdown by model"""
     try:
@@ -257,7 +257,7 @@ async def get_dashboard_models(
 async def get_request_details(
     request_id: str,
     current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db)
 ):
     """Get details for a specific request"""
     try:

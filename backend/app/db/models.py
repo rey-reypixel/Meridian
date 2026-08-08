@@ -27,7 +27,7 @@ class ApiRequest(Base):
     original_cost = Column(Float)
     optimized_cost = Column(Float)
     savings = Column(Float)
-    optimizations_applied = Column(JSON, default=[])  # ["context_truncation", "model_routing"]
+    optimizations_applied = Column(JSON, default=list)  # ["context_truncation", "model_routing"]
     quality_score = Column(Float)  # 0-10 scale
     input_tokens = Column(Integer)
     output_tokens = Column(Integer)

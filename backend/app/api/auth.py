@@ -3,7 +3,8 @@ from sqlalchemy.orm import Session
 from jose import jwt
 from datetime import datetime, timedelta
 from app.config import settings
-from app.db import get_db_session, models
+from app.db import models
+from app.dependencies import get_db
 from app.oauth.google import exchange_code_for_token, get_user_info
 from app.utils.logger import get_logger
 
@@ -26,7 +27,7 @@ async def login():
 
 
 @router.get("/callback")
-async def oauth_callback(code: str = Query(...), db: Session = Depends(get_db_session)):
+async def oauth_callback(code: str = Query(...), db: Session = Depends(get_db)):
     """Handle OAuth callback from Google"""
     try:
         # Exchange code for token

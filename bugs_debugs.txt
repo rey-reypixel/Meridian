@@ -1,0 +1,137 @@
+MERIDIAN — BUGS FOUND & FIXED DURING PHASE 1 TESTING
+======================================================
+Date: 2026-08-08
+Context: First test pass after scaffolding Phase 1 (Foundation). Local Python
+was 3.7.9, incompatible with modern deps, so testing was done via Docker
+(python:3.10-slim) instead.
+
+
+BUG 1 — Wrong FastAPI import name
+----------------------------------
+File:     app/dependencies.py
+Symptom:  App would crash immediately on import/startup.
+Cause:    Imported `HTTPAuthCredentials` from `fastapi.security`, but that
+          class doesn't exist. The real class is `HTTPAuthorizationCredentials`.
+Fix:      Changed import and type hint:
+              from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+              ...
+              credentials: HTTPAuthorizationCredentials = Depends(security)
+
+
+BUG 2 — Async/sync DB session mismatch
+----------------------------------------
+Files:    app/api/routes.py, app/api/auth.py, tests/conftest.py
+Symptom:  Would raise `AttributeError: 'AsyncSession' object has no attribute
+          'query'` on every database-touching endpoint (/api/messages,
+          /api/dashboard/summary, /api/dashboard/models, /api/requests/{id},
+          /auth/callback). Even where `.commit()` exists on AsyncSession, it's
+          a coroutine — calling it without `await` means the commit silently
+          never happens (data loss), no crash, no warning surfaced to caller.
+Cause:    Routes were injecting `get_db_session` (an async generator yielding
+          `AsyncSession` from db/database.py) but all the ORM code written
+          against it used synchronous SQLAlchemy patterns: `db.query(...)`,
+          `db.add(...)`, `db.commit()` without await.
+          Meanwhile `app/dependencies.py`'s `get_current_user` was already
+          correctly using a separate *synchronous* `get_db` (backed by
+          `SessionLocal`) — so the two auth/db paths were inconsistent.
+Fix:      Standardized on the synchronous `get_db` dependency everywhere
+          (matches how the ORM code is actually written):
+            - routes.py: swapped `Depends(get_db_session)` -> `Depends(get_db)`
+              for all 4 endpoints, imported `get_db` from app.dependencies.
+            - auth.py: same swap for the OAuth callback route.
+            - tests/conftest.py: test fixture now overrides `get_db`
+              (was overriding `get_db_session`, which no longer matched any
+              route dependency, so the test db swap was silently doing
+              nothing before this fix).
+Note:     `get_db_session` (async) is still defined in db/database.py for
+          future use, just not wired into any route right now.
+
+
+BUG 3 — Missing email-validator dependency
+---------------------------------------------
+File:     app/db/schemas.py (uses `EmailStr` from pydantic)
+Symptom:  ImportError at import time: "email-validator is not installed,
+          run `pip install 'pydantic[email]'`" — took down the whole app
+          since schemas.py is imported by routes.py at module load.
+Cause:    `pydantic.EmailStr` requires the optional `email-validator`
+          package, which wasn't listed in requirements.txt.
+Fix:      Added `pydantic[email]` to backend/requirements.txt.
+
+
+BUG 4 — Missing numpy dependency
+------------------------------------
+File:     app/services/context_truncation.py
+Symptom:  ModuleNotFoundError: No module named 'numpy'.
+Cause:    File does `import numpy as np` (used for embedding vectors, ahead
+          of full Phase 2 FastEmbed integration) but numpy was never added
+          to requirements.txt.
+Fix:      Added `numpy` to backend/requirements.txt.
+
+
+BUG 5 (minor / code smell) — Mutable default on SQLAlchemy JSON column
+--------------------------------------------------------------------------
+File:     app/db/models.py
+Symptom:  Not yet triggered in practice (routes.py always passes
+          `optimizations_applied` explicitly), but a real landmine: SQLAlchemy
+          column defaults should be callables, not shared mutable objects.
+          Using a literal `[]` means every row that relies on the column
+          default shares the *same* list instance.
+Cause:    `optimizations_applied = Column(JSON, default=[])`
+Fix:      `optimizations_applied = Column(JSON, default=list)`
+
+
+ENVIRONMENT ISSUE (not a code bug, but blocked local testing)
+-------------------------------------------------------------
+Symptom:  `pip install -r requirements.txt` failed for fastapi, tiktoken,
+          anthropic (jiter dependency) — "no matching distribution found".
+Cause:    Local machine's only Python is 3.7.9 (Windows Store install).
+          tiktoken and anthropic's `jiter` dependency are Rust-backed and
+          no longer publish wheels for Python 3.7 (both require 3.8+, and
+          the README already specifies Python 3.10+).
+Resolution: Skipped fighting the local interpreter. Built and ran everything
+          inside the existing Dockerfile (python:3.10-slim), which was
+          already part of the Phase 1 scaffold. All 31 tests pass there.
+
+
+RESULT
+------
+After the above fixes: 31/31 tests passed inside the Docker container
+(python:3.10.20, pytest 9.1.1).
+  tests/test_cost_predictor.py .... 8 passed
+  tests/test_model_router.py ....... 9 passed
+  tests/test_routes.py ............ 14 passed
+
+
+LIVE SMOKE TEST (real server, real HTTP, not just pytest)
+-----------------------------------------------------------
+Rebuilt the image clean (requirements.txt now has all fixes baked in, no
+manual pip installs needed), then ran the container for real with uvicorn
+on port 8001 and hit it with curl:
+
+  GET  /health                          -> 200 {"status":"healthy",...}
+  GET  /                                -> 200 {"name":"Meridian",...}
+  GET  /auth/login                      -> 200 returns Google OAuth URL
+  GET  /api/estimate     (no token)     -> 401 (correctly rejected)
+  POST /api/messages     (no token)     -> 401 (correctly rejected)
+  GET  /docs                            -> 200 (Swagger UI loads)
+  GET  /openapi.json                    -> 200 (schema loads)
+
+Then created a real user row in the SQLite DB, minted a real JWT with
+create_access_token(), and re-tested the protected endpoints with a live
+Authorization header:
+
+  GET /api/estimate?prompt=...&model=claude-opus  (with Bearer token)
+    -> 200 {"estimated_cost":0.015165,"token_count":11,"model":"claude-opus"}
+    (tiktoken counted 11 real tokens, cost math checks out against the
+     $15/1M input, $75/1M output Opus pricing table)
+
+  GET /api/dashboard/summary  (with Bearer token)
+    -> 200 {"total_spend_month":0.0,...,"requests_optimized":0}
+    (correct empty-state response for a brand-new user)
+
+This confirms the JWT auth dependency chain, the DB session fix (Bug 2),
+and the cost predictor are wired together correctly end-to-end, not just
+passing in mocked/isolated pytest fixtures.
+
+Container was stopped and removed after verification (`docker stop/rm
+meridian-live`) to free port 8001.
