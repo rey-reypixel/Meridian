@@ -135,3 +135,135 @@ passing in mocked/isolated pytest fixtures.
 
 Container was stopped and removed after verification (`docker stop/rm
 meridian-live`) to free port 8001.
+
+
+======================================================
+PHASE 2 — Postgres + Redis + Celery + real FastEmbed
+======================================================
+Date: 2026-08-08 (same day, continued)
+Context: Brought forward Postgres/Redis/Celery from "later" into Phase 2
+(user's call), plus implemented the real optimization engines that were
+stubbed in Phase 1: FastEmbed semantic context truncation and a real
+Celery+Redis batch queue (Phase 1's batch_manager was imported but never
+actually called from routes.py — dead code).
+
+FIX (proactive, found via reasoning not a failing test) — missing
+HTTPException re-raise in create_message
+--------------------------------------------------------------------------
+File:     app/api/routes.py
+Issue:    create_message's try/except had a catch-all `except Exception`
+          with no `except HTTPException: raise` above it (unlike
+          get_request_details, which already had this pattern correctly).
+          Since Phase 2 adds deliberate `raise HTTPException(504, ...)` /
+          `raise HTTPException(502, ...)` calls inside that same try block
+          for the new batch-processing path, without this fix they'd have
+          been caught by the generic handler and flattened into a useless
+          500 "Error processing request: 504: Batch processing timed out"
+          instead of a real 504/502 with a clean message.
+Fix:      Added `except HTTPException: raise` before the generic handler.
+
+
+CLEANUP — removed dead CacheEntry model
+--------------------------------------------------------------------------
+File:     app/db/models.py, app/db/__init__.py
+Finding:  CacheEntry (a Postgres table for storing embeddings as JSON) was
+          never actually used anywhere — Phase 1's cache.py was a plain
+          in-memory dict that never touched this model. Grepped the whole
+          backend/ to confirm zero references outside its own definition
+          and the __init__.py re-export.
+Action:   Removed it rather than migrate a dead table into Postgres, since
+          Phase 2 moves embeddings to Redis anyway (the model's whole
+          reason to exist).
+
+
+DESIGN NOTE — batching vs. a synchronous HTTP API
+--------------------------------------------------------------------------
+Anthropic's real Message Batches API has ~24h turnaround, which doesn't
+fit a request/response HTTP endpoint. Implemented instead: requests with
+batch=true get pushed onto a Redis list keyed by (model, task_type); once
+the group hits batch_size or sits past batch_timeout, a Celery task
+(meridian.process_batch, in app/celery_app.py) pops the group and calls
+Claude sequentially for each item in the *worker* container, storing each
+result back in Redis under its own request_id. The original HTTP handler
+polls (via run_in_threadpool, so it doesn't block the event loop) for its
+own request_id's result.
+
+Gap: there's no Celery beat/periodic flush (explicit Phase 2 scope
+decision), so a batch with no further arrivals just sits until something
+checks it. Safety net: if a request's own wait_for_result poll times out
+(15s), it force-flushes its batch inline rather than hanging forever or
+erroring for no reason. Verified both paths actually happen (see live
+tests below) — a 2-request batch with batch_size=2 flushed for real via
+Celery .delay() and showed up in the worker's logs; a lone 1-request
+batch (nothing to fill it) correctly fell through to the inline fallback
+after its wait timed out.
+
+
+TESTS
+-----
+48/48 pytest passed in the rebuilt Docker image (up from 31 in Phase 1):
+  tests/test_batch_manager.py ......... 8 passed  (fakeredis, no live Redis needed)
+  tests/test_context_truncation.py .... 9 passed  (fake embedder, no live
+                                                     FastEmbed model or Redis needed)
+  tests/test_cost_predictor.py ........ 8 passed
+  tests/test_model_router.py .......... 9 passed
+  tests/test_routes.py ................ 14 passed
+All of Phase 1's tests still pass unmodified — the short-circuit in
+truncate_context (len(messages) <= preserve_recent returns early) means
+the existing single-message test cases never touch FastEmbed/Redis at
+all, so nothing needed updating there.
+
+
+LIVE STACK VERIFICATION (docker compose up postgres redis backend worker)
+---------------------------------------------------------------------------
+1. Alembic against real Postgres:
+     alembic upgrade head    -> created users + api_requests tables
+     alembic revision --autogenerate -> generated an EMPTY migration
+       (upgrade()/downgrade() both just `pass`), proving the hand-written
+       0001_initial migration exactly matches models.py, zero drift.
+     alembic downgrade base && alembic upgrade head -> both directions
+       ran clean, confirming the downgrade() I wrote by hand is correct.
+
+2. Real FastEmbed semantic truncation (not mocked) against a live 7-message
+   conversation containing two unrelated topics (capital of France vs.
+   chocolate cake recipe): correctly dropped the 2 "France" messages while
+   keeping all 5 cake-related ones. First call: ~17s (cold model download
+   from HF Hub, no HF_TOKEN warning is expected/harmless). Second call on
+   the exact same messages: 5.8ms — served entirely from the Redis
+   embedding cache, in a brand-new Python process, never touched the
+   FastEmbed model at all. Confirmed 5 embedding keys landed in Redis
+   (meridian:embedding:*).
+
+3. Real Celery dispatch: forced batch_size=2 in-process, sent 2 requests
+   to the same (model, task_type) batch key. Second request's add_to_batch
+   triggered process_batch_task.delay(...) for real. Worker logs show:
+     Task meridian.process_batch[...] received
+     HTTP Request: POST https://api.anthropic.com/v1/messages "401 ..."  (x2)
+     Task meridian.process_batch[...] succeeded in 1.7s
+   i.e. the worker container actually picked up the task, called Anthropic
+   twice (sequentially, one per grouped request), got real 401s (no valid
+   API key available in this environment), and completed successfully
+   because process_batch_task catches per-item errors and stores them
+   rather than crashing the task.
+
+4. Live HTTP round-trip through POST /api/messages with a real Postgres
+   user + JWT:
+     batch:true,  1 lone request -> waited, no natural flush, inline
+       fallback triggered -> 502 "Error processing batched request:
+       ...401 invalid x-api-key" (clean propagation, not swallowed to 500
+       — this is what the HTTPException re-raise fix above enabled)
+     batch:false -> 500 "Error processing request: ...401 invalid
+       x-api-key" (expected generic-error path, also clean)
+     GET /api/estimate, /api/dashboard/summary, /api/dashboard/models
+       -> all 200, correct empty-state / cost-math responses against the
+       live Postgres user row created for this test.
+
+No valid ANTHROPIC_API_KEY is available in this environment, so the full
+happy path (an actual successful completion) couldn't be exercised end to
+end — every failure above is a real 401 from Anthropic, not a bug in
+Meridian's code. Everything upstream of the Anthropic call (routing,
+truncation, batching, cost estimation, auth, persistence) is verified
+working against real infrastructure, not mocks.
+
+Postgres/Redis/backend/worker were left running after this test (not torn
+down) in case further live testing is wanted.

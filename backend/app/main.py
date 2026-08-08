@@ -1,14 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.db import init_db
 from app.api import routes, auth
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Initialize database
-init_db()
+# Schema is provisioned via Alembic (`alembic upgrade head`), not at import
+# time. See app/db/database.py::init_db for the dev-only create_all() escape
+# hatch, kept for convenience but no longer called automatically.
 
 # Create FastAPI app
 app = FastAPI(

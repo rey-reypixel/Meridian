@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 import uuid
@@ -80,13 +81,42 @@ async def create_message(
         optimized_cost = optimized_estimate["estimated_cost"]
         savings = max(0, original_cost - optimized_cost)
 
-        # Call Claude API
-        response = await llm_client.create_message(
-            model=routed_model,
-            messages=truncated_messages,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature
-        )
+        # Call Claude API (direct, or grouped through the batch queue)
+        if request.batch and settings.batch_processing_enabled:
+            task_type = model_router.classify_task(prompt_text)
+            batch_key = batch_manager.add_to_batch(
+                request_id=request_id,
+                model=routed_model,
+                task_type=task_type,
+                request_data={
+                    "model": routed_model,
+                    "messages": truncated_messages,
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                }
+            )
+            batch_result = await run_in_threadpool(
+                batch_manager.wait_for_result, request_id, batch_key, 15.0
+            )
+            if batch_result is None:
+                raise HTTPException(
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail="Batch processing timed out"
+                )
+            if "error" in batch_result:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Error processing batched request: {batch_result['error']}"
+                )
+            response = batch_result
+            optimizations_applied.append("batch_processing")
+        else:
+            response = await llm_client.create_message(
+                model=routed_model,
+                messages=truncated_messages,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature
+            )
 
         # Calculate actual cost
         input_tokens = response["input_tokens"]
@@ -135,6 +165,8 @@ async def create_message(
             }
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in create_message: {str(e)}")
         raise HTTPException(

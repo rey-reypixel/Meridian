@@ -1,22 +1,63 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=meridian
+      - POSTGRES_PASSWORD=meridian
+      - POSTGRES_DB=meridian
+    ports:
+      - "5433:5432"
+    volumes:
+      - meridian-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meridian -d meridian"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    environment:
-      - DEBUG=True
-      - DATABASE_URL=sqlite:///./meridian.db
-      - DATABASE_ASYNC_URL=sqlite+aiosqlite:///./meridian.db
     volumes:
       - ./backend:/app
-      - ./backend/data:/app/data
     env_file:
       - ./backend/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./backend:/app
+    env_file:
+      - ./backend/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.celery_app worker --loglevel=info
 
   dashboard:
     build:
@@ -29,3 +70,6 @@ services:
     environment:
       - VITE_API_URL=http://localhost:8000
     command: npm run dev
+
+volumes:
+  meridian-postgres-data:

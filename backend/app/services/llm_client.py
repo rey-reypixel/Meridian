@@ -10,6 +10,33 @@ class OptimizedLLMClient:
     def __init__(self):
         self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
+    def _call(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        system: str,
+    ) -> Dict[str, Any]:
+        try:
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system if system else None,
+                messages=messages
+            )
+
+            return {
+                "content": response.content[0].text,
+                "stop_reason": response.stop_reason,
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "request_id": str(uuid.uuid4())
+            }
+        except Exception as e:
+            raise Exception(f"Error calling Claude API: {str(e)}")
+
     async def create_message(
         self,
         model: str,
@@ -31,24 +58,21 @@ class OptimizedLLMClient:
         Returns:
             Response with content and usage info
         """
-        try:
-            response = self.client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system if system else None,
-                messages=messages
-            )
+        return self._call(model, messages, max_tokens, temperature, system)
 
-            return {
-                "content": response.content[0].text,
-                "stop_reason": response.stop_reason,
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-                "request_id": str(uuid.uuid4())
-            }
-        except Exception as e:
-            raise Exception(f"Error calling Claude API: {str(e)}")
+    def create_message_sync(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+        system: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Synchronous variant of create_message, for use inside Celery tasks
+        (the worker process has no event loop to await into).
+        """
+        return self._call(model, messages, max_tokens, temperature, system)
 
     async def count_tokens_for_messages(
         self,

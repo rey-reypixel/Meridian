@@ -7,9 +7,15 @@ class Settings(BaseSettings):
     debug: bool = True
     secret_key: str = "your-secret-key-change-this"
 
-    # Database
-    database_url: str = "sqlite:///./meridian.db"
-    database_async_url: str = "sqlite+aiosqlite:///./meridian.db"
+    # Database (Postgres)
+    database_url: str = "postgresql+psycopg2://meridian:meridian@postgres:5432/meridian"
+    database_async_url: str = "postgresql+asyncpg://meridian:meridian@postgres:5432/meridian"
+
+    # Redis
+    redis_url: str = "redis://redis:6379/0"
+    celery_broker_url: str = "redis://redis:6379/1"
+    celery_result_backend: str = "redis://redis:6379/2"
+    embedding_cache_ttl_seconds: int = 60 * 60 * 24
 
     # Anthropic API
     anthropic_api_key: str = ""

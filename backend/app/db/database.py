@@ -3,10 +3,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.config import settings
 
-# Synchronous database setup (for initial migrations/setup)
+# Synchronous database setup
 engine = create_engine(
     settings.database_url,
-    connect_args={"check_same_thread": False},
+    pool_pre_ping=True,
     echo=settings.debug
 )
 
@@ -43,5 +43,10 @@ async def get_db_session() -> AsyncSession:
 
 
 def init_db():
-    """Initialize database tables"""
+    """Dev-only convenience: create tables directly, bypassing Alembic.
+
+    Real schema provisioning is `alembic upgrade head`. Kept for tests
+    (which use their own throwaway SQLite engine) and quick local checks —
+    not called automatically on app startup.
+    """
     Base.metadata.create_all(bind=engine)

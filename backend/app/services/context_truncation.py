@@ -1,39 +1,86 @@
-from typing import List, Dict, Any
-from app.config import settings
+from typing import List, Dict, Optional
 import numpy as np
+from fastembed import TextEmbedding
+from app.config import settings
+from app.services.cache import embedding_cache
 
 
 class ContextTruncation:
-    """Semantic context truncation using embeddings"""
+    """Semantic context truncation using FastEmbed embeddings"""
+
+    _model: Optional[TextEmbedding] = None
 
     def __init__(self):
-        """Initialize FastEmbed model - Phase 2 implementation"""
-        self.model = None
         self.enabled = settings.context_truncation_enabled
+
+    @property
+    def model(self) -> TextEmbedding:
+        """Lazily load the embedding model on first use (expensive, load once)"""
+        if ContextTruncation._model is None:
+            ContextTruncation._model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        return ContextTruncation._model
+
+    def get_embedding(self, text: str) -> np.ndarray:
+        """Get embedding for text, using the Redis cache on hit"""
+        cached = embedding_cache.get_embedding(text)
+        if cached is not None:
+            return cached
+
+        embedding = next(self.model.embed([text]))
+        embedding_cache.set_embedding(text, embedding)
+        return embedding
+
+    def semantic_score(self, message: str, reference: str) -> float:
+        """Cosine similarity between a message and a reference text"""
+        if not message or not reference:
+            return 0.0
+
+        emb_a = self.get_embedding(message)
+        emb_b = self.get_embedding(reference)
+
+        norm_a = np.linalg.norm(emb_a)
+        norm_b = np.linalg.norm(emb_b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+
+        return float(np.dot(emb_a, emb_b) / (norm_a * norm_b))
 
     def truncate_context(
         self,
         messages: List[Dict[str, str]],
-        relevance_threshold: float = None,
-        preserve_recent: int = None
+        relevance_threshold: Optional[float] = None,
+        preserve_recent: Optional[int] = None
     ) -> List[Dict[str, str]]:
         """
-        Truncate message context by removing irrelevant messages
-
-        Phase 1: Return messages as-is
-        Phase 2: Implement semantic relevance scoring
+        Truncate message context by dropping older messages that aren't
+        semantically relevant to the latest message. The most recent
+        `preserve_recent` messages are always kept untouched.
         """
-        if not self.enabled or relevance_threshold is None:
+        if not self.enabled or not messages:
             return messages
 
-        relevance_threshold = relevance_threshold or settings.context_relevance_threshold
-        preserve_recent = preserve_recent or settings.preserve_recent_messages
+        relevance_threshold = (
+            relevance_threshold if relevance_threshold is not None
+            else settings.context_relevance_threshold
+        )
+        preserve_recent = (
+            preserve_recent if preserve_recent is not None
+            else settings.preserve_recent_messages
+        )
 
-        # Phase 1: Simple truncation - keep last N messages
-        if len(messages) > preserve_recent:
-            return messages[-preserve_recent:]
+        if len(messages) <= preserve_recent:
+            return messages
 
-        return messages
+        recent = messages[-preserve_recent:]
+        older = messages[:-preserve_recent]
+        anchor = messages[-1]["content"]
+
+        kept_older = [
+            msg for msg in older
+            if self.semantic_score(msg["content"], anchor) >= relevance_threshold
+        ]
+
+        return kept_older + recent
 
     def get_compression_ratio(self, original_messages: List[Dict], truncated_messages: List[Dict]) -> float:
         """Calculate compression ratio"""

@@ -33,12 +33,3 @@ class ApiRequest(Base):
     output_tokens = Column(Integer)
     latency_ms = Column(Integer)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class CacheEntry(Base):
-    __tablename__ = "cache_entries"
-
-    id = Column(Integer, primary_key=True, index=True)
-    message_hash = Column(String, unique=True, index=True)
-    embedding = Column(JSON)  # Store as JSON, ideally numpy array serialized
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
