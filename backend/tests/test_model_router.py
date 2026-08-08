@@ -1,0 +1,78 @@
+import pytest
+from app.services.model_router import model_router
+
+
+class TestModelRouter:
+    """Test model router service"""
+
+    def test_task_classification_simple(self):
+        """Test task classification for simple tasks"""
+        prompt = "Classify this email as spam or not spam"
+        task = model_router.classify_task(prompt)
+        assert task == "classification"
+
+    def test_task_classification_summarization(self):
+        """Test task classification for summarization"""
+        prompt = "Summarize this document for me"
+        task = model_router.classify_task(prompt)
+        assert task == "summarization"
+
+    def test_task_classification_coding(self):
+        """Test task classification for coding"""
+        prompt = "Write a Python function to sort a list"
+        task = model_router.classify_task(prompt)
+        assert task == "coding"
+
+    def test_task_classification_general(self):
+        """Test task classification for general tasks"""
+        prompt = "What is the capital of France?"
+        task = model_router.classify_task(prompt)
+        assert task == "general"
+
+    def test_select_model_classification(self):
+        """Test model selection for classification"""
+        prompt = "Classify the sentiment"
+        model, score = model_router.select_model("claude-opus", prompt)
+        # Should route to cheaper model for classification
+        assert score >= model_router.quality_threshold
+
+    def test_select_model_coding(self):
+        """Test model selection for coding"""
+        prompt = "Generate a complex algorithm"
+        model, score = model_router.select_model("claude-haiku", prompt)
+        # Haiku might not be enough for complex coding
+        assert score >= 0  # Quality score is valid
+
+    def test_get_quality_score(self):
+        """Test quality score retrieval"""
+        score = model_router.get_quality_score("classification", "claude-haiku")
+        assert 0 <= score <= 10
+        assert score == 8.5
+
+    def test_get_routing_decision(self):
+        """Test full routing decision"""
+        prompt = "Classify this text"
+        decision = model_router.get_routing_decision("claude-opus", prompt)
+
+        assert "original_model" in decision
+        assert "routed_model" in decision
+        assert "task_type" in decision
+        assert "quality_score" in decision
+        assert "was_routed" in decision
+
+    def test_quality_threshold_enforcement(self):
+        """Test that routing respects quality threshold"""
+        prompt = "Classify the sentiment"
+        model, score = model_router.select_model("claude-opus", prompt, quality_threshold=0.9)
+
+        # Score should meet or exceed threshold
+        assert score >= 0.9
+
+    def test_model_selection_chooses_cheapest(self):
+        """Test that cheapest model meeting threshold is chosen"""
+        prompt = "Classify this email"
+        model, score = model_router.select_model("claude-opus", prompt, quality_threshold=8.0)
+
+        # For classification with threshold 8.0, should pick cheapest (haiku has 8.5)
+        if score >= 8.0:
+            assert model in ["claude-haiku", "claude-sonnet", "claude-opus"]

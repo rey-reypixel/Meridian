@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=True
+      - DATABASE_URL=sqlite:///./meridian.db
+      - DATABASE_ASYNC_URL=sqlite+aiosqlite:///./meridian.db
+    volumes:
+      - ./backend:/app
+      - ./backend/data:/app/data
+    env_file:
+      - ./backend/.env
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  dashboard:
+    build:
+      context: ./dashboard
+    ports:
+      - "3000:5173"
+    volumes:
+      - ./dashboard:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    command: npm run dev
