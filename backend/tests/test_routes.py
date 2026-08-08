@@ -188,6 +188,28 @@ class TestDashboardRoutes:
         assert "total_savings" in data
         assert "savings_percentage" in data
         assert "requests_optimized" in data
+        assert "total_tokens_processed" in data
+        assert "avg_latency_ms" in data
+
+    @patch("app.services.llm_client.llm_client.create_message")
+    def test_dashboard_summary_aggregates_tokens_and_latency(self, mock_llm, authenticated_client):
+        """total_tokens_processed and avg_latency_ms should reflect real requests"""
+        mock_llm.return_value = {
+            "content": "ok",
+            "stop_reason": "end_turn",
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "request_id": "test-agg"
+        }
+        authenticated_client.post("/api/messages", json={
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "Hello"}]
+        })
+
+        response = authenticated_client.get("/api/dashboard/summary")
+        data = response.json()
+        assert data["total_tokens_processed"] == 15
+        assert data["avg_latency_ms"] >= 0
 
     def test_dashboard_models_requires_auth(self, client):
         """Test that dashboard models requires authentication"""
@@ -201,6 +223,88 @@ class TestDashboardRoutes:
         data = response.json()
         assert "models" in data
         assert isinstance(data["models"], list)
+
+
+class TestRequestListRoutes:
+    """Test the GET /api/requests list endpoint"""
+
+    def test_list_requests_requires_auth(self, client):
+        response = client.get("/api/requests")
+        assert response.status_code == 401
+
+    def test_list_requests_empty(self, authenticated_client):
+        response = authenticated_client.get("/api/requests")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"] == []
+        assert data["total"] == 0
+        assert data["page"] == 1
+        assert data["page_size"] == 20
+
+    @patch("app.services.llm_client.llm_client.create_message")
+    def test_list_requests_returns_created_requests_most_recent_first(self, mock_llm, authenticated_client):
+        mock_llm.return_value = {
+            "content": "ok", "stop_reason": "end_turn",
+            "input_tokens": 10, "output_tokens": 5, "request_id": "test-1"
+        }
+        authenticated_client.post("/api/messages", json={
+            "model": "claude-haiku", "messages": [{"role": "user", "content": "first"}]
+        })
+        authenticated_client.post("/api/messages", json={
+            "model": "claude-sonnet", "messages": [{"role": "user", "content": "second"}]
+        })
+
+        response = authenticated_client.get("/api/requests")
+        data = response.json()
+        assert data["total"] == 2
+        assert len(data["items"]) == 2
+        # most recent (second request) first
+        assert data["items"][0]["original_model"] == "claude-sonnet"
+        assert data["items"][1]["original_model"] == "claude-haiku"
+        assert "id" in data["items"][0]
+        assert "created_at" in data["items"][0]
+
+    @patch("app.services.llm_client.llm_client.create_message")
+    def test_list_requests_filters_by_model(self, mock_llm, authenticated_client):
+        mock_llm.return_value = {
+            "content": "ok", "stop_reason": "end_turn",
+            "input_tokens": 10, "output_tokens": 5, "request_id": "test-1"
+        }
+        authenticated_client.post("/api/messages", json={
+            "model": "claude-haiku", "messages": [{"role": "user", "content": "first"}],
+            "optimize_for": "quality"
+        })
+        authenticated_client.post("/api/messages", json={
+            "model": "claude-sonnet", "messages": [{"role": "user", "content": "second"}],
+            "optimize_for": "quality"
+        })
+
+        response = authenticated_client.get("/api/requests?model=claude-haiku")
+        data = response.json()
+        assert data["total"] == 1
+        assert data["items"][0]["routed_model"] == "claude-haiku"
+
+    @patch("app.services.llm_client.llm_client.create_message")
+    def test_list_requests_pagination(self, mock_llm, authenticated_client):
+        mock_llm.return_value = {
+            "content": "ok", "stop_reason": "end_turn",
+            "input_tokens": 10, "output_tokens": 5, "request_id": "test-1"
+        }
+        for i in range(3):
+            authenticated_client.post("/api/messages", json={
+                "model": "claude-haiku", "messages": [{"role": "user", "content": f"msg {i}"}]
+            })
+
+        response = authenticated_client.get("/api/requests?page=1&page_size=2")
+        data = response.json()
+        assert data["total"] == 3
+        assert len(data["items"]) == 2
+        assert data["page"] == 1
+        assert data["page_size"] == 2
+
+        response2 = authenticated_client.get("/api/requests?page=2&page_size=2")
+        data2 = response2.json()
+        assert len(data2["items"]) == 1
 
 
 class TestHealthCheck:

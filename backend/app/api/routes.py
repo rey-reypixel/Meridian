@@ -3,7 +3,8 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from datetime import datetime
 import uuid
 import time
 import json
@@ -14,7 +15,7 @@ from app.db.database import SessionLocal
 from app.db.schemas import (
     MessagesCreateRequest, MessagesCreateResponse, MessageResponse,
     CostEstimate, CostEstimateResponse, DashboardSummary, DashboardModels,
-    ModelCostBreakdown, RequestDetail
+    ModelCostBreakdown, RequestDetail, RequestListResponse
 )
 from app.dependencies import get_current_user, get_db
 from app.services.cost_predictor import cost_predictor
@@ -394,13 +395,17 @@ async def get_dashboard_summary(
                 total_savings=0.0,
                 savings_percentage=0.0,
                 requests_optimized=0,
-                avg_quality_score=0.0
+                avg_quality_score=0.0,
+                total_tokens_processed=0,
+                avg_latency_ms=0.0
             )
 
         total_original = sum(r.original_cost or 0 for r in requests)
         total_optimized = sum(r.optimized_cost or 0 for r in requests)
         total_savings = sum(r.savings or 0 for r in requests)
         avg_quality = sum(r.quality_score or 0 for r in requests) / len(requests)
+        total_tokens = sum((r.input_tokens or 0) + (r.output_tokens or 0) for r in requests)
+        avg_latency = sum(r.latency_ms or 0 for r in requests) / len(requests)
 
         savings_pct = (total_savings / total_original * 100) if total_original > 0 else 0
 
@@ -410,7 +415,9 @@ async def get_dashboard_summary(
             total_savings=round(total_savings, 2),
             savings_percentage=round(savings_pct, 2),
             requests_optimized=len(requests),
-            avg_quality_score=round(avg_quality, 2)
+            avg_quality_score=round(avg_quality, 2),
+            total_tokens_processed=total_tokens,
+            avg_latency_ms=round(avg_latency, 2)
         )
     except Exception as e:
         logger.error(f"Error in get_dashboard_summary: {str(e)}")
@@ -457,6 +464,70 @@ async def get_dashboard_models(
         )
 
 
+def _to_request_detail(request: models.ApiRequest) -> RequestDetail:
+    return RequestDetail(
+        id=request.id,
+        created_at=request.created_at,
+        original_model=request.original_model or "",
+        routed_model=request.routed_model or "",
+        original_cost=request.original_cost or 0,
+        optimized_cost=request.optimized_cost or 0,
+        savings=request.savings or 0,
+        optimizations_applied=request.optimizations_applied or [],
+        quality_score=request.quality_score or 0,
+        input_tokens=request.input_tokens or 0,
+        output_tokens=request.output_tokens or 0,
+        latency_ms=request.latency_ms or 0
+    )
+
+
+@router.get("/requests", response_model=RequestListResponse)
+async def list_requests(
+    page: int = 1,
+    page_size: int = 20,
+    model: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List requests for the current user, most recent first"""
+    try:
+        page = max(page, 1)
+        page_size = min(max(page_size, 1), 100)
+
+        query = db.query(models.ApiRequest).filter(
+            models.ApiRequest.user_id == current_user.id
+        )
+
+        if model:
+            query = query.filter(models.ApiRequest.routed_model == model)
+        if start_date:
+            query = query.filter(models.ApiRequest.created_at >= start_date)
+        if end_date:
+            query = query.filter(models.ApiRequest.created_at <= end_date)
+
+        total = query.count()
+
+        results = query.order_by(models.ApiRequest.created_at.desc()) \
+            .offset((page - 1) * page_size) \
+            .limit(page_size) \
+            .all()
+
+        return RequestListResponse(
+            items=[_to_request_detail(r) for r in results],
+            total=total,
+            page=page,
+            page_size=page_size
+        )
+    except Exception as e:
+        logger.error(f"Error in list_requests: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error fetching requests"
+        )
+
+
 @router.get("/requests/{request_id}", response_model=RequestDetail)
 async def get_request_details(
     request_id: str,
@@ -478,14 +549,7 @@ async def get_request_details(
                 detail="Request not found"
             )
 
-        return RequestDetail(
-            original_cost=request.original_cost or 0,
-            optimized_cost=request.optimized_cost or 0,
-            savings=request.savings or 0,
-            optimizations_applied=request.optimizations_applied or [],
-            quality_score=request.quality_score or 0,
-            latency_ms=request.latency_ms or 0
-        )
+        return _to_request_detail(request)
     except HTTPException:
         raise
     except Exception as e:

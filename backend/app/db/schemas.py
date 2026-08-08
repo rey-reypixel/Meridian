@@ -76,6 +76,8 @@ class DashboardSummary(BaseModel):
     savings_percentage: float
     requests_optimized: int
     avg_quality_score: float
+    total_tokens_processed: int
+    avg_latency_ms: float
 
 
 class ModelCostBreakdown(BaseModel):
@@ -90,12 +92,28 @@ class DashboardModels(BaseModel):
 
 
 class RequestDetail(BaseModel):
+    id: str
+    created_at: datetime
+    original_model: str
+    routed_model: str
     original_cost: float
     optimized_cost: float
     savings: float
     optimizations_applied: List[str]
     quality_score: float
+    input_tokens: int
+    output_tokens: int
     latency_ms: int
+
+    class Config:
+        from_attributes = True
+
+
+class RequestListResponse(BaseModel):
+    items: List[RequestDetail]
+    total: int
+    page: int
+    page_size: int
 
 
 # OAuth schemas

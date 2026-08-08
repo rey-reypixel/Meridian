@@ -29,10 +29,11 @@ def db():
 def client(db):
     """Create test client"""
     def override_get_db():
-        try:
-            yield db
-        finally:
-            db.close()
+        # Don't close here - this runs after every single request that
+        # depends on get_db, which broke any test making 2+ authenticated
+        # calls (the session would already be closed by the second one).
+        # The `db` fixture's own teardown closes it once, after the test.
+        yield db
 
     app.dependency_overrides[get_db] = override_get_db
 
