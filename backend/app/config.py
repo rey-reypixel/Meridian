@@ -42,6 +42,16 @@ class Settings(BaseSettings):
     context_relevance_threshold: float = 0.7
     preserve_recent_messages: int = 5
 
+    # Task classification (embedding-based similarity against example prompts)
+    task_classification_min_confidence: float = 0.3
+
+    # Semantic response cache
+    response_cache_enabled: bool = True
+    response_cache_similarity_threshold: float = 0.97  # deliberately high - a wrong hit is worse than a miss
+    response_cache_max_entries: int = 200  # per model
+    response_cache_ttl_seconds: int = 60 * 60
+    response_cache_max_temperature: float = 0.3  # don't cache/serve highly stochastic requests
+
     # Logging
     log_level: str = "INFO"
 

@@ -1,5 +1,6 @@
 import anthropic
-from typing import List, Dict, Any
+import asyncio
+from typing import List, Dict, Any, AsyncGenerator
 from app.config import settings
 from app.services.cost_predictor import cost_predictor
 import uuid
@@ -10,6 +11,9 @@ class OptimizedLLMClient:
 
     def __init__(self):
         self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        # Separate async client, needed for real streaming - the sync
+        # client above can't do async iteration.
+        self.async_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     def _mock_call(
         self,
@@ -94,6 +98,68 @@ class OptimizedLLMClient:
         (the worker process has no event loop to await into).
         """
         return self._call(model, messages, max_tokens, temperature, system)
+
+    async def _mock_stream(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Dev/test-only fake streaming - mirrors _mock_call but yields word-chunks"""
+        input_text = "\n".join(m.get("content", "") for m in messages)
+        content = f"[MOCK RESPONSE] Simulated {model} streaming completion for {len(messages)} message(s)."
+        words = content.split(" ")
+
+        for i, word in enumerate(words):
+            chunk = word if i == 0 else f" {word}"
+            yield {"type": "delta", "text": chunk}
+            await asyncio.sleep(0.02)
+
+        yield {
+            "type": "done",
+            "content": content,
+            "input_tokens": cost_predictor.count_tokens(input_text),
+            "output_tokens": min(cost_predictor.count_tokens(content), max_tokens),
+        }
+
+    async def stream_message(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+        system: str = "",
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream a completion. Yields {"type": "delta", "text": ...} chunks
+        as they arrive, then a final {"type": "done", "content",
+        "input_tokens", "output_tokens"}.
+        """
+        if settings.mock_anthropic:
+            async for event in self._mock_stream(model, messages, max_tokens):
+                yield event
+            return
+
+        try:
+            async with self.async_client.messages.stream(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system if system else None,
+                messages=messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield {"type": "delta", "text": text}
+
+                final_message = await stream.get_final_message()
+                yield {
+                    "type": "done",
+                    "content": final_message.content[0].text,
+                    "input_tokens": final_message.usage.input_tokens,
+                    "output_tokens": final_message.usage.output_tokens,
+                }
+        except Exception as e:
+            raise Exception(f"Error streaming from Claude API: {str(e)}")
 
     async def count_tokens_for_messages(
         self,

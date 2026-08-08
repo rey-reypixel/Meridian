@@ -1,6 +1,32 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from app.db.models import User
+from app.services.response_cache import response_cache
+
+
+def fake_similarity(text_a: str, text_b: str) -> float:
+    """Deterministic stand-in for embedding cosine similarity (see
+    tests/test_model_router.py) - avoids needing live Redis/FastEmbed for
+    route tests that go through _prepare_optimized_request's task
+    classification step."""
+    words_a = set(text_a.lower().split())
+    words_b = set(text_b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    overlap = words_a & words_b
+    return len(overlap) / max(len(words_a), len(words_b))
+
+
+@pytest.fixture(autouse=True)
+def mock_embeddings():
+    # Caching behavior itself is covered by tests/test_response_cache.py -
+    # here it just needs to be off so response_cache.get()/.set() don't
+    # try to hit a real (unreachable in this test run) Redis.
+    original_cache_enabled = response_cache.enabled
+    response_cache.enabled = False
+    with patch("app.services.model_router.embedding_service.similarity", side_effect=fake_similarity):
+        yield
+    response_cache.enabled = original_cache_enabled
 
 
 class TestAuthRoutes:

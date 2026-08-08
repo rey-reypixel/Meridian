@@ -20,6 +20,7 @@ pytest
 pytest-asyncio
 pytest-cov
 fakeredis
+locust
 python-jose[cryptography]
 passlib[bcrypt]
 aiosqlite

@@ -482,3 +482,219 @@ it's just that round(total_cost, 2) isn't granular enough to show a
 sub-cent aggregate. Not worth fixing at toy test scale; real usage
 volumes would accumulate past $0.01 quickly and this wouldn't be visible
 in practice.
+
+
+======================================================
+PHASE 2.6 — Four free high-impact additions (in progress)
+======================================================
+Date: 2026-08-09
+Context: User asked what would make the project more compelling to
+companies without spending money. Landed on 4 items fully buildable AND
+verifiable at $0: embedding-based task classification (replacing keyword
+matching), semantic response caching, streaming responses, and real load
+testing. (Real Batch API integration, LLM-as-judge quality calibration,
+and multi-provider support were discussed but need paid API calls to
+verify, so deferred.)
+
+Status: DONE. Build, full test suite (68/68), and live verification
+against the real running stack (Postgres/Redis/Celery, MOCK_ANTHROPIC=true)
+including a real Locust load-test run all complete - see the LIVE
+VERIFICATION and REAL LOAD TEST RESULTS sections below.
+
+WHAT WAS BUILT
+---------------
+1. New app/services/embeddings.py - EmbeddingService, extracted out of
+   context_truncation.py so the FastEmbed model + Redis cache load once
+   and get shared across context truncation, task classification, and
+   response caching (previously only context_truncation.py owned this;
+   loading a second copy for the new consumers would've doubled memory
+   and cold-start time). context_truncation.py now delegates to it.
+
+2. app/services/model_router.py: classify_task() now embeds the prompt
+   and compares it via cosine similarity against TASK_EXAMPLES (a few
+   canonical prompts per category), instead of brittle keyword matching
+   (`"classify" in prompt.lower()`). Falls back to "general" if even the
+   best match scores below task_classification_min_confidence (0.3).
+
+3. New app/services/response_cache.py - Redis-backed semantic cache, keyed
+   per model. A near-duplicate prompt (cosine similarity >=
+   response_cache_similarity_threshold, default 0.97 - deliberately high,
+   since a wrong hit is worse than a miss) returns the cached response
+   instead of calling the LLM. FIFO eviction past
+   response_cache_max_entries (200/model), TTL 1h. Only checked/populated
+   when request.temperature <= response_cache_max_temperature (0.3) -
+   reusing a stale response instead of sampling a new one isn't obviously
+   correct for high-temperature/creative requests, so those are excluded
+   rather than pretending this is solved.
+
+4. Streaming: app/services/llm_client.py gained stream_message() (a
+   second AsyncAnthropic client for real async streaming; mock mode
+   yields the same [MOCK RESPONSE] text word-by-word so streaming is also
+   testable at $0). New POST /api/messages/stream endpoint (SSE), rejects
+   batch=true with 400 (streaming a deferred/grouped batch result isn't a
+   coherent combination without a much bigger pub/sub redesign - out of
+   scope). Checks/populates the response cache same as the direct
+   endpoint; on a cache hit, fake-streams the cached text in word-chunks
+   instead of hitting the LLM.
+
+5. backend/loadtest/ - locustfile.py + setup_test_user.py, ready to run
+   against the live stack with MOCK_ANTHROPIC=true (free, and it's
+   actually the *correct* way to isolate Meridian's own routing/
+   truncation/DB overhead from Claude's response time, which is what the
+   README's latency claims are really about).
+
+BUGS / DESIGN ISSUES FOUND WHILE BUILDING THIS
+------------------------------------------------
+Real inefficiency fixed: classify_task() was being called up to 3x per
+request (inside select_model, again in get_routing_decision, again in
+routes.py's batch block) - harmless with cheap keyword matching, wasteful
+once it's an embedding + N-example similarity computation. Refactored
+model_router.py so select_model()/get_routing_decision() both accept an
+optional pre-computed task_type, and routes.py's new
+_prepare_optimized_request() helper (extracted from create_message, now
+shared with the new streaming endpoint) classifies once and threads the
+result through everywhere, including the batch block.
+
+Real design question resolved: does the DB session injected via
+Depends(get_db) stay valid for the full lifetime of a StreamingResponse
+generator, or does FastAPI close it once the endpoint function returns
+(before the stream finishes)? Rather than trust version-dependent
+behavior here, create_message_stream's generator opens its own
+SessionLocal() directly and closes it in a finally block, so the DB
+write's lifetime is self-contained and correct regardless of FastAPI/
+Starlette's exact dependency-cleanup timing for streaming responses. This
+is a genuine, unresolved-in-my-head design tension, not a hypothetical -
+worth flagging that it hasn't been proven safe via the alternative
+(Depends(get_db)) approach, only via sidestepping the question entirely.
+
+Test infra gap found and fixed: after wiring in embedding-based
+classification, every test that goes through create_message or
+create_message_stream started failing with
+`redis.exceptions.ConnectionError: ... Name or service not known` -
+_prepare_optimized_request now unconditionally calls classify_task()
+(needs Redis for the embedding cache) and, separately, the new response
+cache check also needs Redis directly. Neither is reachable in an
+isolated `docker run` test invocation (no compose network). Fixed by:
+mocking app.services.model_router.embedding_service.similarity with a
+deterministic word-overlap fake in test_routes.py and test_streaming.py
+(same pattern as test_model_router.py), and disabling response_cache.enabled
+for the duration of those tests (caching behavior itself is covered
+separately by test_response_cache.py, so these files don't need real
+Redis at all now).
+
+Test bug (mine, not the code's) caught by the suite doing its job: wrote
+test_stream_delivers_chunks_in_order_then_done asserting
+model_used == "claude-opus" for the prompt "Hello" without accounting for
+the Bug 10 fix from Phase 2.5 (quality_threshold default corrected to
+8.5) - "Hello" classifies as "general" (no embedding overlap with any
+TASK_EXAMPLES), general/opus scores 9.0 but general/sonnet scores 8.5
+which already clears the threshold, so it legitimately routes down to
+sonnet - exactly the same behavior already verified live in Phase 2's
+"capital of France" test. Fixed the test to pass optimize_for="quality"
+so model_used is deterministic, rather than changing the (correct)
+routing behavior.
+
+TESTS
+-----
+68/68 passing (up from 53):
+  tests/test_model_router.py - reworked for embedding-based
+    classification: mocks embedding_service.similarity with a
+    deterministic word-overlap function (avoids needing a real model load
+    or live Redis), 5 new tests including the low-confidence fallback and
+    the task_type-passthrough-skips-reclassification behavior.
+  tests/test_response_cache.py (new, 8 tests) - fake embeddings + real
+    fakeredis: set/get roundtrip, near-duplicate hit, dissimilar miss,
+    per-model isolation, disabled-cache no-op, FIFO eviction at the cap.
+  tests/test_streaming.py (new, 4 tests) - mocked llm_client.stream_message,
+    verifies SSE chunk order, final metadata shape, batch+stream rejected
+    with 400, and that the DB write actually lands (via the SessionLocal
+    patch described above).
+  tests/test_context_truncation.py - unchanged, still passes as-is (its
+    per-instance get_embedding monkeypatch survives the delegation
+    refactor untouched).
+
+LIVE VERIFICATION (real Postgres/Redis/Celery, MOCK_ANTHROPIC=true, $0 cost)
+-------------------------------------------------------------------------------
+Date: 2026-08-09. Force-recreated backend+worker (`docker compose up -d
+--force-recreate backend worker`) to pick up the latest image (the
+previous containers were 2h old, predating all of Phase 2.6, and
+critically didn't have `locust` installed yet). Postgres/Redis left
+running unchanged.
+
+1. Embedding-based classification, real paraphrase (not exact keyword
+   match): "Please categorize this ticket by urgency level" -> correctly
+   classified "classification", routed opus->haiku (8.5 score meets 8.5
+   threshold), 95% cost savings. First live call took 113s - real
+   FastEmbed cold-start (fresh container, model not yet cached on disk).
+
+2. Interesting real finding, worth being honest about: "Sort this
+   feedback into urgent versus non-urgent buckets" (deliberately avoids
+   every old keyword) got classified as "coding" (quality_score 8.8 =
+   coding/sonnet), not "classification". The word "sort" is pulling
+   toward the coding example ("Write a Python function to sort a list")
+   even though the sentence's actual intent is triage/categorization.
+   This is a genuine limitation of a 3-4-example-per-category classifier -
+   a single strong lexical anchor can dominate over whole-sentence intent.
+   Not a code bug; a real, observed characteristic of the current
+   TASK_EXAMPLES set worth knowing about (and a good candidate for the
+   later LLM-as-judge quality-calibration work discussed but deferred, or
+   just a larger/better-chosen example set).
+
+3. Semantic response caching:
+   - Exact-duplicate prompt ("Explain quantum entanglement simply" sent
+     twice): second call correctly showed "semantic_cache" in
+     optimizations_applied, identical cost, latency dropped 42ms -> 10ms.
+   - Near-duplicate paraphrase ("...tallest mountain in the world?" vs
+     "...tallest mountain on Earth?"): did NOT hit. Measured the actual
+     cosine similarity directly (embedding_service.similarity(...)) =
+     0.9663 against the 0.97 threshold - missed by 0.004. Confirms the
+     threshold is doing real, precise work, not just a rubber-stamped
+     config value; this specific paraphrase is a legitimate near-miss,
+     not a broken cache.
+
+4. Streaming: real curl -N SSE round-trip against POST
+   /api/messages/stream - word-by-word "[MOCK RESPONSE] Simulated
+   claude-sonnet streaming completion..." chunks arrived in order,
+   followed by a correct final `done` event with real cost/routing
+   metadata. Queried Postgres directly for that request_id afterward and
+   confirmed the ApiRequest row was actually persisted (input_tokens=5,
+   output_tokens=20, correct cost) - validates the self-contained
+   SessionLocal() design decision from earlier in this phase actually
+   works, not just "should work in theory."
+
+5. GET /api/dashboard/summary after the above: requests_optimized=7,
+   savings_percentage=76.84%, avg_quality_score=8.61 - correct live
+   aggregation.
+
+REAL LOAD TEST RESULTS (Locust, 20 users, spawn rate 5/s, 45s, against
+the live stack with MOCK_ANTHROPIC=true - this measures Meridian's own
+routing/truncation/DB overhead, not Claude's response time, which is
+what the README's latency claims are actually supposed to be about)
+-----------------------------------------------------------------------
+Command: docker exec -e LOCUST_JWT=<token> meridian-backend-1 locust
+  -f loadtest/locustfile.py --host http://localhost:8000
+  --headless -u 20 -r 5 -t 45s --csv=/tmp/loadtest_results
+
+682 total requests, 0 failures (0.00%), 15.4 req/s aggregate throughput.
+
+Per-endpoint (median / p95 / p99, milliseconds):
+  GET  /api/dashboard/summary          11 / 73 / 81
+  GET  /api/estimate                    5 / 21 / 68
+  POST /api/messages                   18 / 52 / 86
+  POST /api/messages (long context)    20 / 35 / 76
+  Aggregated                           17 / 42 / 86   (p99.9 = 200, max = 200)
+
+Notable: "long context" requests (8 messages, exercises real context
+truncation + embedding similarity lookups against Redis) show
+essentially the same latency as the plain single-message endpoint
+(20ms vs 18ms median) once the embedding cache is warm - the semantic
+truncation pipeline isn't adding meaningful overhead once the model's
+loaded and embeddings are cached, which is the whole point of caching
+them in the first place.
+
+These are real numbers from this specific machine/environment, not
+representative of production hardware or network conditions - but
+they're genuine, zero-failure results, not fabricated ones like the
+README's current "Performance Benchmarks" table. Whether/how to update
+that table with these numbers (or re-run in a more production-like
+environment first) is a decision for later, not made here.

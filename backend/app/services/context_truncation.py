@@ -1,34 +1,18 @@
 from typing import List, Dict, Optional
 import numpy as np
-from fastembed import TextEmbedding
 from app.config import settings
-from app.services.cache import embedding_cache
+from app.services.embeddings import embedding_service
 
 
 class ContextTruncation:
     """Semantic context truncation using FastEmbed embeddings"""
 
-    _model: Optional[TextEmbedding] = None
-
     def __init__(self):
         self.enabled = settings.context_truncation_enabled
 
-    @property
-    def model(self) -> TextEmbedding:
-        """Lazily load the embedding model on first use (expensive, load once)"""
-        if ContextTruncation._model is None:
-            ContextTruncation._model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-        return ContextTruncation._model
-
     def get_embedding(self, text: str) -> np.ndarray:
         """Get embedding for text, using the Redis cache on hit"""
-        cached = embedding_cache.get_embedding(text)
-        if cached is not None:
-            return cached
-
-        embedding = next(self.model.embed([text]))
-        embedding_cache.set_embedding(text, embedding)
-        return embedding
+        return embedding_service.get_embedding(text)
 
     def semantic_score(self, message: str, reference: str) -> float:
         """Cosine similarity between a message and a reference text"""
@@ -37,13 +21,7 @@ class ContextTruncation:
 
         emb_a = self.get_embedding(message)
         emb_b = self.get_embedding(reference)
-
-        norm_a = np.linalg.norm(emb_a)
-        norm_b = np.linalg.norm(emb_b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-
-        return float(np.dot(emb_a, emb_b) / (norm_a * norm_b))
+        return embedding_service.cosine_similarity(emb_a, emb_b)
 
     def truncate_context(
         self,
