@@ -484,8 +484,14 @@ Meridian runs as five services: `backend` (FastAPI), `worker` (Celery),
 docker compose up -d
 ```
 
-Cloud hosting (Railway, AWS, Fly.io, etc.) hasn't been set up yet — this
-project currently runs locally via Docker Compose only.
+### Live deployment
+
+Currently running on an AWS EC2 instance (Ubuntu, Docker Compose, the same
+setup as above), verified reachable end-to-end — health check, Alembic
+migrations against real Postgres, and the API responding over the public
+internet, not just localhost. No stable domain or HTTPS in front of it yet,
+so no public link here for now; that's the next step once those are in
+place.
 
 ---
 
