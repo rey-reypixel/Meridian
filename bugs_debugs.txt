@@ -761,3 +761,126 @@ closing every gap - Track A wires directly to what's real today, Track B
 scaffolds the rest with clearly-marked mock data until/unless the
 backend gaps above get closed. Frontend implementation itself is
 happening in a separate conversation, not tracked further in this file.
+
+
+======================================================
+LIVE AWS DEPLOYMENT — full troubleshooting log
+======================================================
+Date: 2026-08-09
+Context: user wanted the backend actually live on the internet, not just
+locally verified, partly to genuinely close an AWS-experience gap they'd
+flagged as a resume concern. Chose AWS over Railway/Vercel deliberately -
+see PROJECT_STATUS.md for the reasoning (Vercel doesn't fit a
+stateful/worker-based backend at all; Railway's real 2026 free tier is
+~$1/month non-rollover credit, not enough for a 4-service stack).
+
+ISSUE 1 — Docker build ran out of disk space mid-build
+--------------------------------------------------------------------------
+Instance: EC2 t3.micro, Ubuntu 26.04 LTS, default 8GB root EBS volume.
+Symptom:  `docker compose up -d` failed for both backend and worker
+          images with "write ... no space left on device" partway
+          through unpacking the built image layers.
+Cause:    8GB is genuinely too small to build two ~1GB Python images
+          (FastEmbed pulls in onnxruntime, Locust pulls in gevent - both
+          add real weight) on top of the Ubuntu base + Docker's own
+          intermediate build layers, which temporarily use more space
+          than the final images before cleanup.
+Fix:      Resized the EBS volume 8GB -> 20GB via EC2 Console -> Volumes
+          -> Modify Volume (gp3 free tier covers up to 30GB/month, so
+          this cost nothing extra). Ubuntu's cloud-init auto-grew the
+          actual root filesystem on the resize event - manual
+          `growpart`/`resize2fs` against the specific NVMe partition
+          reported "NOCHANGE... cannot be grown" (it was pointed at the
+          wrong partition in the AMI's layout) but this was harmless
+          noise since cloud-init had already done the real work; `df -h`
+          confirmed 13GB free afterward. Then `docker system prune -f`
+          to clear the failed build's partial layers, and retried
+          `docker compose up -d postgres redis backend worker`
+          successfully.
+
+
+ISSUE 2 — SSH connection timed out after editing the security group
+--------------------------------------------------------------------------
+Symptom:  SSH access worked fine initially. After going into the EC2
+          security group console to add inbound rules for Caddy (ports
+          80/443), `ssh -i meridian.pem ubuntu@<ip>` started timing out
+          entirely - not "connection refused," a full timeout (suggests
+          traffic wasn't reaching the instance on port 22 at all).
+Cause:    Not confirmed with certainty (didn't diff the exact before/
+          after rule set), but the most likely explanation: the SSH
+          rule's Source was originally set via "My IP" at instance
+          launch time, capturing whatever the home ISP's public IP was
+          at that moment. Home IPs aren't static - it had very likely
+          changed since then, and re-selecting "My IP" fresh (which
+          re-detects the CURRENT address) during the same edit session
+          that added the HTTP/HTTPS rules coincided with this being
+          discovered, since that's when the mismatch actually got
+          checked/fixed.
+Fix:      EC2 -> Security Groups -> the instance's group -> Edit inbound
+          rules -> SSH row -> Source dropdown -> re-select "My IP" (forces
+          a fresh detection) -> Save. SSH connected immediately after.
+Lesson for next time: if SSH mysteriously stops working with no config
+changes on the *SSH rule itself*, check whether the home IP simply
+changed before assuming something else broke - this is a common false
+alarm that looks like a "we broke it" bug but is actually just DHCP churn
+on the client side.
+
+
+ISSUE 3 — Elastic IP association looked like it worked but hadn't
+--------------------------------------------------------------------------
+Symptom:  After allocating and (apparently) associating an Elastic IP via
+          the instance's "Actions" context menu, the instance summary
+          page showed "Disassociate Elastic IP address" as an available
+          action (implying one WAS associated) and the Public IPv4
+          address field even showed a value - but the actual EC2 ->
+          Instances list view's dedicated "Elastic IP" column showed a
+          plain dash (-), meaning nothing was actually attached.
+Cause:    The "Disassociate Elastic IP address" menu option appears to
+          always be present/clickable in that context menu regardless of
+          actual association state - it's not a reliable status
+          indicator. The Instances list column and the dedicated Elastic
+          IPs page (EC2 -> Network & Security -> Elastic IPs, checking the
+          "Associated instance ID" column there) are the only reliable
+          places to confirm real association state.
+Fix:      Went to EC2 -> Network & Security -> Elastic IPs directly,
+          allocated fresh (Amazon's IPv4 pool, network border group
+          matching the instance's region), selected it, used the green
+          "Associate this Elastic IP address" banner button (appears
+          right after allocation - faster than the Actions dropdown),
+          picked the Meridian instance. Confirmed for real via the
+          Elastic IPs list showing "Associated instance ID" populated.
+Result:   13.234.145.240 - permanent public IP, won't change on
+          instance stop/restart, unlike the original auto-assigned
+          65.0.124.203 which was only ever guaranteed to survive as long
+          as the instance kept running continuously.
+Follow-up: DuckDNS's "current ip" field had to be manually updated to the
+          new Elastic IP (DuckDNS has no automatic awareness of AWS
+          Elastic IP changes - it's a completely separate service pointed
+          at a value someone set once and has to update again if the
+          target ever changes).
+
+
+RESULT — full HTTPS chain verified working
+--------------------------------------------------------------------------
+Domain: meridianpixelated.duckdns.org (free, DuckDNS - GitHub Student
+Developer Pack was tried first for a proper domain but the user couldn't
+complete student verification through it, so fell back to DuckDNS, which
+needs no verification at all and works fine with Let's Encrypt).
+
+Caddy installed via the official apt repo, configured with a two-line
+Caddyfile (`domain { reverse_proxy localhost:8000 }`), reloaded - it
+automatically obtained a real Let's Encrypt certificate with no manual
+ACME configuration needed, since it could reach the domain over port 80
+once that rule was added to the security group (see Issue 2's rules).
+
+Verified in a real browser (not curl): https://meridianpixelated.duckdns.org/health
+returned the healthy JSON response with a valid padlock, no certificate
+warnings. This is genuinely deployed, HTTPS-secured infrastructure, not a
+claim - the full path (EC2 -> Elastic IP -> DuckDNS -> Caddy -> Let's
+Encrypt -> FastAPI backend -> Postgres) was each individually verified
+working, not just assumed from the final result.
+
+Not yet done: real Google OAuth credentials (blocked purely on the user
+setting these up in Google Cloud Console - the code side has existed
+since Phase 1). See PROJECT_STATUS.md "In progress" section for exact
+next steps.

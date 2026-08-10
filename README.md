@@ -486,12 +486,18 @@ docker compose up -d
 
 ### Live deployment
 
-Currently running on an AWS EC2 instance (Ubuntu, Docker Compose, the same
-setup as above), verified reachable end-to-end — health check, Alembic
-migrations against real Postgres, and the API responding over the public
-internet, not just localhost. No stable domain or HTTPS in front of it yet,
-so no public link here for now; that's the next step once those are in
-place.
+Running on an AWS EC2 instance (Ubuntu, Docker Compose, the same setup as
+above) behind a Caddy reverse proxy with automatic HTTPS (Let's Encrypt),
+on a fixed address (AWS Elastic IP + free DNS via DuckDNS, since a paid
+domain wasn't part of this project's budget). Verified end-to-end: health
+check, Alembic migrations against real Postgres, and the API responding
+over real HTTPS on the public internet, not just localhost.
+
+Google OAuth login isn't wired up with real credentials yet (in progress —
+Google requires HTTPS for non-localhost redirect URIs, which is what
+prompted setting up the domain/HTTPS in the first place), so there's no
+public link published here yet. The dashboard frontend also isn't deployed
+yet (separate work in progress). Link goes here once both are ready.
 
 ---
 
