@@ -1,10 +1,12 @@
 from fastapi import APIRouter, HTTPException, Query, Depends, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from jose import jwt
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from app.config import settings
 from app.db import models
-from app.dependencies import get_db
+from app.dependencies import get_db, get_current_user
 from app.oauth.google import exchange_code_for_token, get_user_info
 from app.utils.logger import get_logger
 
@@ -26,9 +28,16 @@ async def login():
     return {"auth_url": google_auth_url}
 
 
-@router.get("/callback")
+@router.get("/google/callback")
 async def oauth_callback(code: str = Query(...), db: Session = Depends(get_db)):
-    """Handle OAuth callback from Google"""
+    """
+    Handle OAuth callback from Google. Deliberately not at /auth/callback -
+    that path is the frontend SPA's own route (reads ?token= after this
+    handler's redirect below). Same-origin deployments proxy /auth/* to
+    this backend except for that one frontend-owned path, so Google's
+    provider-facing callback needs a distinct path to avoid colliding
+    with it.
+    """
     try:
         # Exchange code for token
         token_response = await exchange_code_for_token(code)
@@ -75,15 +84,11 @@ async def oauth_callback(code: str = Query(...), db: Session = Depends(get_db)):
         # Create JWT token
         jwt_token = create_access_token(email)
 
-        return {
-            "access_token": jwt_token,
-            "token_type": "bearer",
-            "user": {
-                "id": user.id,
-                "email": user.email,
-                "name": user.name
-            }
-        }
+        # Hand off to the frontend, which reads ?token= and stores it -
+        # a bare JSON response here has no real page for the browser to
+        # land on after Google's redirect.
+        redirect_url = f"{settings.frontend_url}/auth/callback?token={quote(jwt_token)}"
+        return RedirectResponse(url=redirect_url)
     except HTTPException:
         raise
     except Exception as e:
@@ -98,6 +103,21 @@ async def oauth_callback(code: str = Query(...), db: Session = Depends(get_db)):
 async def logout():
     """Logout endpoint"""
     return {"message": "Logged out successfully"}
+
+
+@router.get("/me")
+async def get_me(current_user: models.User = Depends(get_current_user)):
+    """
+    Resolve the current user from the stored JWT. Needed because the OAuth
+    redirect only carries the token itself (see oauth_callback) - anything
+    that reloads the page (not just the first login moment) needs a way to
+    re-derive who's logged in from the token alone.
+    """
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "name": current_user.name,
+    }
 
 
 def create_access_token(email: str) -> str:

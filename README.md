@@ -1,439 +1,223 @@
 # Meridian — Intelligent LLM Cost Optimization Engine
 
-**Reduce your LLM API spend by 30-70% without sacrificing quality.**
-
-Meridian automatically optimizes every request to your LLM APIs through intelligent context truncation, smart model routing, batch processing, and cost prediction.
+**A self-hosted API that sits in front of Claude and automatically cuts cost per request** — via context truncation, model routing, semantic response caching, and batch processing.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
 
+**Live:** [meridianpixelated.duckdns.org](https://meridianpixelated.duckdns.org) — real backend + real dashboard, deployed on AWS EC2 behind HTTPS. Google login isn't wired up with real credentials yet (see [Deployment](#-deployment)), so there's nothing to sign in with yet — but every endpoint and page renders honestly against whatever data actually exists (mostly none, right now).
+
 ---
 
 ## 🎯 The Problem
 
-Startups using LLMs are hemorrhaging money:
+Teams calling LLM APIs directly tend to overspend in a few predictable ways:
 
-- **Redundant context:** Sending entire conversation histories when only last 3 messages matter
-- **Wrong models:** Using Claude Opus for tasks that work fine with Haiku
-- **No batching:** Processing requests one-at-a-time instead of in batches (50% cheaper)
-- **Blind spending:** No visibility into actual API costs until after requests are made
+- **Redundant context:** sending an entire conversation history when only the last few messages are relevant
+- **Wrong model for the task:** using a frontier model for something a cheaper one handles fine
+- **No batching:** processing requests one at a time instead of grouping them
+- **No visibility:** not knowing what a request actually cost until the bill arrives
 
-**Result:** $50k/month LLM bills that could be $15k-30k with optimization.
-
----
-
-## ✨ The Solution
-
-Meridian sits between your application and LLM APIs, automatically optimizing every request:
-
-```
-Your App → Meridian Optimization Engine → LLM API
-             (30-70% cost reduction)
-```
-
-### What Meridian Does
-
-#### 1. **Semantic Context Truncation** 🎯
-Removes irrelevant messages from conversation history using embeddings.
-
-```
-Before:
-- 500 message conversation (200k tokens)
-- Cost: $6.00 per request
-
-After (Meridian):
-- 3 relevant messages (2k tokens)
-- Cost: $0.06 per request
-- Savings: $5.94 per request → $594/day (100 requests)
-```
-
-#### 2. **Intelligent Model Routing** 🔄
-Automatically selects the cheapest model that meets your quality threshold.
-
-```
-Simple task (email classification):
-  Claude Opus: $0.015/req
-  → Meridian routes to Haiku: $0.0005/req
-  → Savings: 97%
-
-Complex task (research report):
-  Claude Haiku: Won't work
-  → Meridian uses Opus: $0.015/req
-  → Quality maintained
-```
-
-#### 3. **Batch Processing Optimization** 📦
-Groups similar requests and processes them together (30-50% cheaper).
-
-```
-10 document summaries:
-  One-at-a-time: $1.50
-  → Meridian batches: $0.75
-  → Savings: 50%
-```
-
-#### 4. **Cost Prediction & Budgeting** 💰
-Know the cost BEFORE calling the API. Set per-request budgets.
-
-```python
-response = meridian.messages.create(
-    model="claude-opus",
-    messages=[...],
-    max_tokens=1000,
-    cost_limit=0.50  # Don't spend more than $0.50 on this
-)
-```
+Meridian is a small FastAPI service that sits between your app and the Claude API, and applies four concrete optimizations to every request before it goes out.
 
 ---
 
-## 📊 Real-World Impact
+## ✨ How It Works
 
-**Production deployment (anonymized client):**
+```
+Your App → POST /api/messages → Meridian → Claude API
+                                  (context truncation, model routing,
+                                   semantic cache, batching)
+```
 
-| Metric | Before | After | Change |
-|--------|--------|-------|--------|
-| Monthly spend | $3,000 | $1,800 | **-40%** |
-| Avg cost/request | $0.45 | $0.27 | **-40%** |
-| Quality score | 9.2/10 | 9.1/10 | Negligible |
-| Payback period | — | **< 1 week** | — |
+Every request through `/api/messages` runs through this pipeline:
 
-**Annual savings at 100 requests/day:** ~$43,200
+#### 1. Context Truncation
+Uses [FastEmbed](https://github.com/qdrant/fastembed) (`BAAI/bge-small-en-v1.5`) to embed each message in a conversation and drop ones below a relevance threshold, always preserving the most recent N messages. Skipped automatically when `optimize_for="speed"` (computing embeddings adds latency you may not want).
+
+#### 2. Model Routing
+Classifies the task type from the prompt, then checks whether a cheaper model in the Claude lineup (Haiku → Sonnet → Opus) can still clear the request's `quality_threshold` for that task type. Routes down when it can; never routes below what you asked for when `optimize_for="quality"`.
+
+#### 3. Semantic Response Cache
+Before calling Claude, checks whether a near-duplicate prompt has already been answered (cosine similarity against cached embeddings). Only consulted when `temperature` is low enough that reusing a prior response is defensible — reusing an old response instead of sampling a new one isn't obviously correct for highly stochastic requests, so it's skipped above `response_cache_max_temperature`.
+
+#### 4. Batch Processing
+When `batch=true`, groups the request into a Celery-managed queue instead of calling Claude immediately, processed with other similar requests.
+
+#### 5. Cost Prediction & Budgeting
+`GET /api/estimate` returns a cost estimate (via `tiktoken`) before you call anything. `POST /api/messages` accepts an optional `cost_limit` and returns `402 Payment Required` instead of spending anything if the optimized estimate exceeds it.
+
+Every request's `optimizations_applied`, real cost before/after, and quality score are persisted and visible in [the dashboard](#-dashboard) or via `GET /api/requests`.
 
 ---
 
-## 🚀 Quick Start
+## 📊 Verified Results
 
-### Installation
+Real output from this codebase — **not production client data** (there isn't any yet; see [Deployment](#-deployment)). This is a 459-request batch run locally against real token counts and real Anthropic pricing tables, with `MOCK_ANTHROPIC=true` so no actual Claude API spend was involved and the routing/cost math could be verified deterministically.
+
+| Metric | Value |
+|--------|-------|
+| Requests processed | 459 |
+| Total estimated cost (unoptimized) | $1.36 |
+| Total estimated cost (optimized) | $0.17 |
+| Savings | $1.20 (87.9%) |
+| Avg quality score | 8.5 / 10 |
+| Model mix | 458 → Sonnet, 1 → Haiku |
+
+You can reproduce this yourself: run `docker compose up -d` with `MOCK_ANTHROPIC=true` (the default in `.env.example`), send requests through `/api/messages`, and check `GET /api/dashboard/summary` — every number there is computed live from whatever's actually in Postgres, never hardcoded.
+
+---
+
+## 🚀 Getting Started
+
+Meridian is a Docker Compose stack: FastAPI backend, Celery worker, Postgres, Redis, and a React dashboard. There is no separate SDK to install — you call the API directly.
 
 ```bash
-pip install meridian-llm
+git clone https://github.com/rey-reypixel/Meridian.git
+cd Meridian
+cp backend/.env.example backend/.env
+# fill in ANTHROPIC_API_KEY, or leave MOCK_ANTHROPIC=true to run everything
+# for $0 with real token counts and fake completion text
+docker compose up -d
 ```
 
-### Basic Usage
+- Backend: `http://localhost:8000` (interactive docs at `/docs`)
+- Dashboard: `http://localhost:3000`
 
-```python
-from meridian import OptimizedClient
+Real login requires a Google OAuth Client ID/Secret in `backend/.env` (see `.env.example`) — without one, `/auth/login` will return a URL that Google will reject.
 
-# Initialize
-client = OptimizedClient(
-    api_key="sk-...",
-    optimization_mode="balanced"  # balanced, aggressive, quality-first
-)
+### Calling the API directly
 
-# Use exactly like normal Claude API
-response = client.messages.create(
-    model="claude-opus",
-    messages=[
-        {"role": "user", "content": "Summarize this 500-message conversation..."}
-    ],
-    optimize_for="cost"  # New parameter
-)
-
-print(response.content[0].text)
-print(f"Cost: ${response.metadata['cost']:.2f}")
-print(f"Saved: ${response.metadata['savings']:.2f}")
+```bash
+curl -X POST http://localhost:8000/api/messages \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-opus",
+    "messages": [{"role": "user", "content": "Classify this support ticket: ..."}],
+    "optimize_for": "cost",
+    "quality_threshold": 8.0
+  }'
 ```
 
-### With Django/FastAPI
-
-```python
-from fastapi import FastAPI
-from meridian import OptimizedClient
-
-app = FastAPI()
-meridian = OptimizedClient(api_key="sk-...")
-
-@app.post("/analyze")
-async def analyze(text: str):
-    response = meridian.messages.create(
-        model="claude-opus",
-        messages=[{"role": "user", "content": text}],
-        optimize_for="cost"
-    )
-    return {
-        "result": response.content[0].text,
-        "cost": response.metadata['cost'],
-        "savings": response.metadata['savings']
-    }
+```json
+{
+  "content": { "content": "...", "role": "assistant" },
+  "metadata": {
+    "cost": 0.000306,
+    "original_cost": 0.003855,
+    "savings": 0.003549,
+    "model_used": "claude-sonnet",
+    "model_original": "claude-opus",
+    "optimizations_applied": ["model_routing"],
+    "quality_score": 8.5,
+    "latency_ms": 8
+  }
+}
 ```
+
+---
+
+## 🖥️ Dashboard
+
+React 18 + TypeScript + Tailwind, talking to the real API — no hardcoded metrics anywhere. Currently covers:
+
+- **Overview** — spend/savings KPIs, model mix, recent requests
+- **Requests** — paginated, filterable (by model, date range) table of every processed request
+- **Request Detail** — full breakdown of a single request: routing decision, cost before/after, which optimizations fired
+
+Optimizations/Analytics/Settings pages exist in the nav but aren't built yet (they'd need backend data — like time-series history and per-mechanism $ attribution — that doesn't exist yet either). They render an honest "not built yet" placeholder rather than fake content.
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│         Your Application                    │
-└────────────────┬────────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────────┐
-│      Meridian API Gateway                   │
-│  ┌─────────────────────────────────────┐   │
-│  │ Request Interceptor & Preprocessor  │   │
-│  └────────────────┬────────────────────┘   │
-│                   │                         │
-│  ┌────────────────▼────────────────────┐   │
-│  │   Cost Predictor                    │   │
-│  │   (tiktoken-based estimation)       │   │
-│  └────────────────┬────────────────────┘   │
-│                   │                         │
-│  ┌────────────────▼────────────────────┐   │
-│  │   Context Truncation Engine         │   │
-│  │   (FastEmbed + Semantic Search)     │   │
-│  └────────────────┬────────────────────┘   │
-│                   │                         │
-│  ┌────────────────▼────────────────────┐   │
-│  │   Model Router                      │   │
-│  │   (Decision tree + A/B testing)     │   │
-│  └────────────────┬────────────────────┘   │
-│                   │                         │
-│  ┌────────────────▼────────────────────┐   │
-│  │   Batch Queue Manager               │   │
-│  │   (Groups similar requests)         │   │
-│  └────────────────┬────────────────────┘   │
-└─────────────────┬────────────────────────────┘
-                  │
-         ┌────────┼────────┐
-         │        │        │
-         ▼        ▼        ▼
-      Claude    GPT-4    Llama
-      APIs      APIs     APIs
-```
-
-### Components
-
-- **Request Interceptor:** Catches all LLM requests before they leave your app
-- **Cost Predictor:** Uses tiktoken to estimate costs before API calls
-- **Context Truncation:** FastEmbed + cosine similarity for semantic relevance
-- **Model Router:** Task classification → optimal model selection
-- **Batch Manager:** Celery-based queue for batch processing
-- **Monitoring:** Prometheus metrics + Grafana dashboard
-- **Cost Logger:** PostgreSQL tracking for analytics
-
----
-
-## ⚙️ Configuration
-
-### Optimization Modes
-
-```python
-# Balanced (default) - good cost/quality tradeoff
-client = OptimizedClient(optimization_mode="balanced")
-
-# Aggressive - maximize cost savings, accept quality tradeoff
-client = OptimizedClient(optimization_mode="aggressive")
-
-# Quality-First - maintain highest quality, minimize cost second
-client = OptimizedClient(optimization_mode="quality_first")
-```
-
-### Model Routing Preferences
-
-```python
-client = OptimizedClient(
-    model_preferences={
-        "simple_classification": "haiku",
-        "summarization": "sonnet",
-        "research_writing": "opus",
-        "default": "sonnet"
-    }
-)
-```
-
-### Context Truncation Settings
-
-```python
-client = OptimizedClient(
-    context_optimization={
-        "enabled": True,
-        "relevance_threshold": 0.7,  # Keep messages with >70% relevance
-        "preserve_recent": 5,  # Always keep last 5 messages
-        "embedding_model": "BAAI/bge-small-en-v1.5"
-    }
-)
-```
-
----
-
-## 📈 Monitoring & Analytics
-
-### Dashboard Endpoints
-
-```python
-# Get spending summary
-GET /api/v1/dashboard/summary
-→ {
-    "total_spend_month": 3000.00,
-    "optimized_spend_month": 1800.00,
-    "total_savings": 1200.00,
-    "savings_percentage": 40,
-    "requests_optimized": 6720
-  }
-
-# Get cost breakdown by model
-GET /api/v1/dashboard/models
-→ {
-    "haiku": {"usage": 40, "cost": 720},
-    "sonnet": {"usage": 45, "cost": 1350},
-    "opus": {"usage": 15, "cost": 450}
-  }
-
-# Get optimization details per request
-GET /api/v1/requests/{request_id}
-→ {
-    "original_cost": 0.45,
-    "optimized_cost": 0.27,
-    "savings": 0.18,
-    "optimizations_applied": [
-      "context_truncation (15% savings)",
-      "model_routing_haiku (60% savings)",
-      "batch_processing (25% savings)"
-    ]
-  }
-```
-
-### Prometheus Metrics
-
-```
-meridian_requests_total{model="opus", optimization="cost"}
-meridian_cost_usd{request_type="summarization"}
-meridian_savings_usd_total
-meridian_quality_score{optimization_mode="balanced"}
-meridian_context_compression_ratio
-meridian_model_routing_decisions_total
-```
-
----
-
-## 🔌 Integration Examples
-
-### With LangChain
-
-```python
-from langchain.llms import Anthropic
-from meridian import MeridianWrapper
-
-# Wrap your Anthropic client
-meridian_wrapped = MeridianWrapper(
-    client=Anthropic(api_key="sk-..."),
-    optimize_for="cost"
-)
-
-# Use with LangChain
-from langchain.chains import LLMChain
-chain = LLMChain(llm=meridian_wrapped, prompt=prompt)
-result = chain.run("your query")
-```
-
-### With OpenAI (GPT-4)
-
-```python
-from meridian import OptimizedClient
-
-# Works with any OpenAI-compatible API
-client = OptimizedClient(
-    api_key="sk-...",
-    provider="openai"
-)
-
-response = client.messages.create(
-    model="gpt-4",
-    messages=[...],
-    optimize_for="cost"
-)
-```
-
-### Production FastAPI Setup
-
-```python
-from fastapi import FastAPI, BackgroundTasks
-from meridian import OptimizedClient
-
-app = FastAPI()
-meridian = OptimizedClient(api_key="sk-...", cache_embeddings=True)
-
-@app.post("/api/query")
-async def handle_query(query: str, background_tasks: BackgroundTasks):
-    # Synchronous response
-    response = meridian.messages.create(
-        model="claude-opus",
-        messages=[{"role": "user", "content": query}],
-        optimize_for="cost"
-    )
-    
-    # Log analytics asynchronously
-    background_tasks.add_task(
-        log_analytics,
-        cost=response.metadata['cost'],
-        savings=response.metadata['savings']
-    )
-    
-    return {"result": response.content[0].text}
+┌──────────────┐      ┌──────────────────────────────────────────┐
+│  Dashboard   │      │              FastAPI Backend              │
+│ React+Vite   │◄────►│                                            │
+└──────────────┘      │  /auth/*   Google OAuth + JWT              │
+                       │  /api/messages(/stream)                   │
+                       │      → cost estimate (tiktoken)            │
+                       │      → context truncation (FastEmbed)      │
+                       │      → model router (task classification)  │
+                       │      → semantic cache (embedding similarity)│
+                       │      → batch queue (Celery) or direct call  │
+                       │  /api/dashboard/*, /api/requests            │
+                       └──────────┬─────────────────┬───────────────┘
+                                  │                 │
+                          ┌───────▼──────┐   ┌──────▼──────┐
+                          │  PostgreSQL  │   │    Redis    │
+                          │ users, requests│  │Celery broker,│
+                          │ (real records) │  │response cache│
+                          └────────────────┘  └──────┬──────┘
+                                                       │
+                                                ┌──────▼──────┐
+                                                │Celery Worker │
+                                                │(batch queue) │
+                                                └──────────────┘
+                                                       │
+                                                ┌──────▼──────┐
+                                                │  Claude API  │
+                                                └──────────────┘
 ```
 
 ---
 
 ## 📋 API Reference
 
-### Core Methods
+Full interactive reference is auto-generated at `/docs` (Swagger UI) once the backend is running. Summary:
 
-#### `messages.create()`
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET`  | `/auth/login` | — | Returns the Google OAuth consent URL |
+| `GET`  | `/auth/google/callback` | — | Google's OAuth redirect target (not user-facing) |
+| `GET`  | `/auth/me` | JWT | Resolve the current user from a token |
+| `POST` | `/auth/logout` | — | No-op (JWTs are stateless; client discards the token) |
+| `POST` | `/api/messages` | JWT | Send a message through the full optimization pipeline |
+| `POST` | `/api/messages/stream` | JWT | Same, streamed via SSE |
+| `GET`  | `/api/estimate` | JWT | Cost estimate for a prompt, no request actually sent |
+| `GET`  | `/api/dashboard/summary` | JWT | Aggregate spend/savings/quality for the current user |
+| `GET`  | `/api/dashboard/models` | JWT | Cost breakdown by model |
+| `GET`  | `/api/requests` | JWT | Paginated request history (`page`, `page_size`, `model`, `start_date`, `end_date`) |
+| `GET`  | `/api/requests/{id}` | JWT | Full detail for one request |
+| `GET`  | `/health` | — | Health check |
 
-```python
-response = client.messages.create(
-    model: str,                              # "claude-opus", "gpt-4", etc.
-    messages: list[dict],                    # Conversation history
-    max_tokens: int = 1024,
-    temperature: float = 0.7,
-    optimize_for: str = "cost",              # "cost", "speed", "quality"
-    cost_limit: float | None = None,         # Max budget per request
-    batch: bool = False,                     # Enable batching
-    quality_threshold: float = 0.9            # Min acceptable quality
-)
-```
+`POST /api/messages` request body:
 
-Returns:
 ```python
 {
-    "content": [{"type": "text", "text": "response..."}],
-    "metadata": {
-        "cost": 0.27,
-        "original_cost": 0.45,
-        "savings": 0.18,
-        "model_used": "haiku",
-        "model_original": "opus",
-        "optimizations_applied": ["context_truncation", "model_routing"],
-        "quality_score": 9.1,
-        "latency_ms": 450
-    }
+  "model": str,                              # "claude-opus" | "claude-sonnet" | "claude-haiku"
+  "messages": [{"role": str, "content": str}],
+  "max_tokens": int = 1024,
+  "temperature": float = 0.7,
+  "optimize_for": "cost" | "speed" | "quality" = "cost",
+  "cost_limit": float | None = None,         # 402 if the optimized estimate exceeds this
+  "batch": bool = False,
+  "quality_threshold": float = 8.5           # 0-10 scale
 }
 ```
 
-#### `get_cost_estimate()`
+---
 
-```python
-estimate = client.get_cost_estimate(
-    prompt: str,
-    model: str = "claude-opus",
-    expected_output_tokens: int = 512
-)
-# Returns: {"estimated_cost": 0.15, "token_count": 2048}
-```
+## ⚙️ Configuration
 
-#### `get_alternative_models()`
+All configuration is environment variables, read from `backend/.env` (see `backend/.env.example` for the full list with defaults):
 
-```python
-alternatives = client.get_alternative_models(
-    model="claude-opus",
-    task_type="classification",
-    max_cost_increase=0.0  # Only show cheaper options
-)
-# Returns: [
-#   {"model": "haiku", "cost": 0.0005, "quality_score": 8.2, "savings": 97%},
-#   {"model": "sonnet", "cost": 0.003, "quality_score": 9.1, "savings": 80%}
-# ]
+```bash
+# Optimization toggles
+CONTEXT_TRUNCATION_ENABLED=true
+MODEL_ROUTING_ENABLED=true
+BATCH_PROCESSING_ENABLED=true
+QUALITY_THRESHOLD=8.5
+CONTEXT_RELEVANCE_THRESHOLD=0.7
+PRESERVE_RECENT_MESSAGES=5
+
+# Dev/test only — skip the real Anthropic call, return a deterministic fake
+# completion. Real token counts (and therefore real cost/routing math) are
+# still computed for real via tiktoken. Never set true in production.
+MOCK_ANTHROPIC=false
 ```
 
 ---
@@ -441,17 +225,16 @@ alternatives = client.get_alternative_models(
 ## 🧪 Testing
 
 ```bash
-# Run tests
-pytest tests/
+cd backend
+pytest tests/ -q                    # 74 tests, real Postgres + FastEmbed + tiktoken
+pytest tests/ -q --cov=app          # with coverage
 
-# Run with coverage
-pytest --cov=meridian tests/
-
-# Performance benchmarks
-pytest tests/benchmarks/ -v
-
-# Cost simulation (without calling actual APIs)
-pytest tests/simulation/ -v
+# Load test (isolates Meridian's own pipeline overhead — Anthropic calls
+# mocked, so this measures routing/truncation/DB cost, not Claude's latency)
+python loadtest/setup_test_user.py   # prints a JWT
+export LOCUST_JWT=<token>
+locust -f loadtest/locustfile.py --host http://localhost:8000 \
+  --headless -u 20 -r 5 -t 60s --csv=loadtest_results
 ```
 
 ---
@@ -460,16 +243,17 @@ pytest tests/simulation/ -v
 
 | Component | Technology |
 |-----------|-----------|
-| **Backend API** | FastAPI (Python 3.10+) |
-| **Embeddings** | FastEmbed (BAAI/bge-small-en-v1.5) |
+| **Backend API** | FastAPI (Python 3.10+), async |
+| **Auth** | Google OAuth 2.0 + JWT (`python-jose`) |
+| **Embeddings** | FastEmbed (`BAAI/bge-small-en-v1.5`), local, no external embedding API |
 | **Token Counting** | tiktoken |
-| **Caching** | Redis |
-| **Database** | PostgreSQL |
-| **Task Queue** | Celery |
-| **Monitoring** | Prometheus + Grafana |
-| **Containerization** | Docker |
-| **CI/CD** | GitHub Actions |
-| **Dashboard** | React 18 + Tailwind CSS |
+| **Database** | PostgreSQL + SQLAlchemy + Alembic |
+| **Cache / Broker** | Redis |
+| **Task Queue** | Celery (batch processing) |
+| **Load Testing** | Locust |
+| **Containerization** | Docker + Docker Compose |
+| **Dashboard** | React 18, TypeScript, Vite, Tailwind CSS, TanStack Query, React Router, Recharts |
+| **Live Reverse Proxy** | Caddy (automatic HTTPS via Let's Encrypt) |
 
 ---
 
@@ -477,8 +261,7 @@ pytest tests/simulation/ -v
 
 ### Docker Compose (what's actually tested)
 
-Meridian runs as five services: `backend` (FastAPI), `worker` (Celery),
-`postgres`, `redis`, and `dashboard`.
+Five services: `backend` (FastAPI), `worker` (Celery), `postgres`, `redis`, `dashboard`.
 
 ```bash
 docker compose up -d
@@ -486,29 +269,22 @@ docker compose up -d
 
 ### Live deployment
 
-Running on an AWS EC2 instance (Ubuntu, Docker Compose, the same setup as
-above) behind a Caddy reverse proxy with automatic HTTPS (Let's Encrypt),
-on a fixed address (AWS Elastic IP + free DNS via DuckDNS, since a paid
-domain wasn't part of this project's budget). Verified end-to-end: health
-check, Alembic migrations against real Postgres, and the API responding
-over real HTTPS on the public internet, not just localhost.
+Running on an AWS EC2 instance (Ubuntu, the same Docker Compose stack as above) behind Caddy with automatic HTTPS (Let's Encrypt), on a fixed address (AWS Elastic IP + free DNS via DuckDNS — a paid domain wasn't part of this project's budget). The dashboard is served as a static production build by Caddy; `/api/*` and the real backend auth endpoints are reverse-proxied to the FastAPI container on the same origin.
 
-Google OAuth login isn't wired up with real credentials yet (in progress —
-Google requires HTTPS for non-localhost redirect URIs, which is what
-prompted setting up the domain/HTTPS in the first place), so there's no
-public link published here yet. The dashboard frontend also isn't deployed
-yet (separate work in progress). Link goes here once both are ready.
+**Live now:** [meridianpixelated.duckdns.org](https://meridianpixelated.duckdns.org)
+
+**Not live yet:** real Google OAuth login. `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` on the live server are still placeholders — that's the user's own Google Cloud Console setup, not a code change. Until that's done, `/auth/login` on the live URL will redirect to Google and get rejected. Everything else (the dashboard shell, empty states, health check, real API responses) is genuinely live and working.
 
 ---
 
 ## 🔐 Security
 
-- **API keys never logged:** Masked in all output
-- **Encrypted transport:** TLS 1.3 for all requests
-- **Rate limiting:** Built-in DDoS protection
-- **Audit logging:** All optimization decisions logged for compliance
-- **No data retention:** Requests processed and deleted immediately
-- **SOC 2 ready:** Audit trail for enterprise compliance
+- Auth is JWT-based (`python-jose`), issued after a real Google OAuth code exchange, verified on every protected endpoint via a FastAPI dependency
+- Secrets (`SECRET_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_CLIENT_SECRET`) are read from environment variables, never committed — `.env` is gitignored, only `.env.example` (with placeholder values) is tracked
+- CORS is restricted to explicitly configured origins (`CORS_ORIGINS`), not wildcarded
+- No prompt or message text is ever persisted to the database — only cost/routing/quality metadata per request (see `RequestDetail` in the API reference)
+
+This is a small project's auth setup, not an audited enterprise security posture — there's no rate limiting, no WAF, and no compliance certification, and none of that is claimed here.
 
 ---
 
@@ -519,7 +295,7 @@ calls mocked so this isolates Meridian's own routing/truncation/caching/DB
 overhead — not Claude's response time):
 
 ```
-692 requests, 0 failures, ~15.5 req/s aggregate
+682 requests, 0 failures, ~15.4 req/s aggregate
 
 Endpoint                        p50    p95    p99
 ─────────────────────────────────────────────────
@@ -531,48 +307,35 @@ GET  /api/dashboard/summary     11ms   73ms  200ms
 Aggregate                       17ms   42ms   86ms
 ```
 
-Cost-reduction percentages (90-95% in tested scenarios) are documented from
-live runs, not this benchmark — see the optimization examples above.
-Quality-loss numbers per task type aren't included here: that requires a
-real evaluation pipeline (comparing actual model outputs against a golden
-set), which doesn't exist yet — see the Roadmap section below.
+Cost-reduction percentages are documented above in [Verified Results](#-verified-results),
+from real routing/cost math, not this latency benchmark. Quality-loss numbers
+per task type aren't included anywhere: that requires a real evaluation
+pipeline (comparing actual model outputs against a golden set), which doesn't
+exist yet — see [Roadmap](#-roadmap).
 
 ---
 
 ## 🤝 Contributing
 
-Contributions welcome! Areas we're looking for:
+Contributions welcome — open an issue or a PR. Areas of particular interest:
 
-- [ ] More LLM provider integrations (Anthropic, OpenAI, Cohere, Llama)
-- [ ] Advanced routing algorithms (ML-based decision trees)
-- [ ] Quality evaluation models
-- [ ] Dashboard improvements
-- [ ] Performance optimizations
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
-
-## 📚 Documentation
-
-- **[Architecture Deep Dive](docs/architecture.md)** — System design & trade-offs
-- **[Optimization Strategies](docs/strategies.md)** — How each technique works
-- **[Monitoring & Observability](docs/monitoring.md)** — Prometheus + Grafana setup
-- **[Case Studies](docs/case-studies.md)** — Real client results
-- **[FAQ](docs/faq.md)** — Common questions
+- More LLM provider support (currently Claude only)
+- ML-based quality evaluation (replacing the current hand-set per-task-type quality scores with measured data)
+- Real Anthropic Batch API integration (current batching groups requests but doesn't yet get the batch-API discount)
+- The Optimizations/Analytics/Settings dashboard pages (blocked on backend data that doesn't exist yet — see the Dashboard section above)
 
 ---
 
 ## 📝 License
 
-MIT License — See [LICENSE](LICENSE) file
+MIT License — see [LICENSE](LICENSE)
 
 ---
 
 ## 💬 Support
 
-- **Issues:** [GitHub Issues](https://github.com/rey-reypixel/meridian/issues)
-- **Discussions:** [GitHub Discussions](https://github.com/rey-reypixel/meridian/discussions)
+- **Issues:** [GitHub Issues](https://github.com/rey-reypixel/Meridian/issues)
+- **Discussions:** [GitHub Discussions](https://github.com/rey-reypixel/Meridian/discussions)
 - **Email:** mahashreyaa@gmail.com
 - **Discord:** doodle_is_glitched
 
@@ -580,27 +343,26 @@ MIT License — See [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
-- FastEmbed team for lightweight embeddings
-- Anthropic for Claude API
-- FastAPI community for the excellent framework
+- FastEmbed / Qdrant team for lightweight local embeddings
+- Anthropic for the Claude API
+- FastAPI community for the framework
 
 ---
 
 ## 📈 Roadmap
 
-Not on a committed timeline — these are the directions being considered, not scheduled releases:
+Not on a committed timeline — directions being considered, not scheduled releases:
 
 - Multi-provider support (OpenAI, others)
 - ML-based quality evaluation (replacing the current hand-set quality scores with measured data)
 - Real Anthropic Batch API integration (current batching groups requests but doesn't yet get the batch-API discount)
 - Self-optimizing routing that learns from historical outcomes
+- Optimizations/Analytics/Settings dashboard pages, once there's real backend data (time-series history, per-mechanism cost attribution) to back them
 
 ---
 
 <div align="center">
 
 **Built by [Mahashreyaa Pathak](https://github.com/rey-reypixel)**
-
-*Reduce your LLM costs. Keep your quality. Ship faster.*
 
 </div>

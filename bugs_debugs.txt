@@ -884,3 +884,157 @@ Not yet done: real Google OAuth credentials (blocked purely on the user
 setting these up in Google Cloud Console - the code side has existed
 since Phase 1). See PROJECT_STATUS.md "In progress" section for exact
 next steps.
+
+
+FRONTEND ISSUE 1 — authenticated user bounced back to /login right after
+a successful token exchange
+--------------------------------------------------------------------------
+Symptom:  Minted a real JWT via the backend (same SessionLocal +
+          create_access_token pattern used throughout backend testing),
+          navigated to /auth/callback?token=<jwt>. AuthCallback correctly
+          stored the token in localStorage and called navigate('/'), but
+          the app landed back on /login instead of the authenticated
+          shell - even though calling GET /auth/me with that exact token
+          (both via curl-equivalent fetch and via the app's own
+          getCurrentUser() called manually) returned 200 with the correct
+          user every time.
+Cause:    Race condition in useAuth's `isLoading` derivation. TanStack
+          Query v5 defines `isLoading` as `isPending && isFetching`. The
+          `currentUser` query starts with `enabled: hasToken`, which
+          flips false -> true the instant the token is stored. On the
+          very next render, `isPending` is already true (no data yet) but
+          `isFetching` hasn't ticked over yet - the actual fetch kicks
+          off in an effect that fires after that render commits. So for
+          one render, `isLoading` reads false while `isAuthenticated`
+          (`!!user`) is also false, and ProtectedRoute treats that as "not
+          loading, not authenticated" and redirects to /login. The
+          `/auth/me` fetch then completes normally in the background, but
+          nothing on the Login page reacts to becoming authenticated, so
+          the user stays stuck on /login despite holding a valid token.
+Fix:      Swapped `isLoading` for `isPending` in the useQuery destructure
+          in dashboard/src/hooks/useAuth.tsx, and derived the context's
+          `isLoading` as `hasToken && isPending` instead of
+          `hasToken && isLoading`. `isPending` stays true for the entire
+          window between "no data yet" and "settled (success or error)",
+          independent of whether a fetch is actively in flight, which
+          closes the race. Also added a defensive `isAuthenticated` check
+          to the top of Login.tsx that redirects to `/` if already
+          authenticated, as a second line of defense for any other path
+          that lands an authenticated user on /login.
+Verified: Fresh browser tab, minted JWT, navigated straight to
+          /auth/callback?token=<jwt> - landed on the real authenticated
+          shell (Sidebar showing "Frontend Test User" /
+          frontend-test@example.com, both pulled live from /auth/me, not
+          hardcoded), zero console errors. Hard-reloaded directly on
+          /requests (not a SPA navigation) to confirm the token-based
+          re-auth also works on a fresh page load, not just the
+          in-session redirect right after /auth/callback - correctly
+          rendered the protected route instead of bouncing to /login.
+
+
+FRONTEND ISSUE 2 — Request Detail's error state never rendered for a
+missing request ID (stuck in loading skeleton forever)
+--------------------------------------------------------------------------
+Symptom:  Navigated to /requests/<id-that-does-not-exist> to test the 404
+          path. GET /api/requests/<id> correctly returned 404 with a real
+          error body, but the page just sat on the loading skeleton
+          forever - ErrorState never appeared, even after waiting several
+          seconds and confirming (via curl and via the app's own api.get()
+          called manually) that the backend and the API client both
+          behaved correctly.
+Cause:    dashboard/src/api/requests.ts's useRequestDetail didn't set a
+          `retry` option, so it inherited the QueryClient's global default
+          (`retry: 1`). Added a temporary diagnostic log of the query's
+          raw status/fetchStatus (same technique used earlier for the
+          Sidebar investigation) and found `fetchStatus: 'paused'` - that
+          value only occurs when TanStack Query v5's networkMode:'online'
+          logic decides the browser is offline and pauses a queued retry.
+          Root cause is almost certainly specific to this browser-
+          automation sandbox mis-firing an 'offline' event at some point
+          (navigator.onLine and onlineManager.isOnline() both read `true`
+          when checked directly, yet the already-paused retry never
+          resumed) rather than a real connectivity issue - consistent
+          with the other "browser automation tooling quirks" already
+          noted in this project (transient Vite dep re-optimization
+          causing invalid-hook-call errors, `computer` click coordinates
+          occasionally not registering - see below). Separately from the
+          environment quirk, retrying a 404 on one specific request ID is
+          pointless regardless of environment - the ID either exists or
+          it doesn't, and no amount of retrying changes that.
+Fix:      Set `retry: false` explicitly on useRequestDetail's query. This
+          is the correct behavior on its own merits (no wasted requests
+          retrying a deterministic not-found), and it also sidesteps the
+          retry-pause path entirely since there's no retry to pause.
+Verified: Fresh tab, same nonexistent ID -> ErrorState rendered
+          immediately ("COULD NOT LOAD REQUEST" / "This request may not
+          exist, or the request failed to load." / Retry button), single
+          404 request in the network log, zero stuck-loading state.
+
+Also observed during this same investigation: the `computer` tool's click
+action occasionally reported success (correct coordinates, matched the
+target element's real bounding box) without the click actually reaching
+the page - confirmed by dispatching `.click()` on the same DOM element
+via javascript_tool immediately after, which worked instantly. Not a
+product bug; noted here only so a future "the button doesn't work"
+investigation in this environment checks a programmatic click before
+assuming the app is broken.
+
+
+FRONTEND ISSUE 3 — /auth/callback path collision when frontend and
+backend share one origin (live deploy only, invisible in local dev)
+--------------------------------------------------------------------------
+Symptom:  First live deploy of the dashboard to
+          https://meridianpixelated.duckdns.org (frontend and backend now
+          served from the same domain via Caddy, unlike local dev where
+          they're on separate ports 3000/8000). Google's OAuth redirect
+          landing page (dashboard/src/pages/AuthCallback.tsx, route
+          /auth/callback, reads ?token=) never rendered - every hit to
+          /auth/callback got a raw JSON 422 from the backend
+          ("Field required: query.code") instead.
+Cause:    Two different things both legitimately needed the exact same
+          path /auth/callback:
+          1. The backend's actual Google-facing OAuth callback
+             (backend/app/api/auth.py's oauth_callback, expects ?code=
+             from Google, then redirects to the frontend with ?token=)
+          2. The frontend SPA's own client-side route that receives that
+             redirect and reads ?token=
+          Locally this never collided because they lived on different
+          origins (localhost:3000 vs localhost:8000). Once both sat
+          behind the same Caddy host for the live deploy, the Caddyfile's
+          `handle /auth/* { reverse_proxy localhost:8000 }` rule sent
+          EVERY /auth/callback request straight to the backend - Google's
+          real hit (?code=) as well as the backend's own redirect back to
+          "the frontend" (?token=), since both used the identical path.
+          The browser never got a chance to load the SPA at that path.
+Fix:      Renamed the backend's actual Google-facing endpoint from
+          /auth/callback to /auth/google/callback (safe to rename freely
+          right now since GOOGLE_CLIENT_ID/SECRET are still placeholders -
+          no real Google Console redirect URI is registered yet to break).
+          Updated OAUTH_REDIRECT_URI (config.py default, .env.example,
+          and the live server's .env) to match. Updated the live
+          Caddyfile to whitelist the specific real backend auth paths
+          (/auth/login, /auth/google/*, /auth/me, /auth/logout) instead
+          of blanket-proxying /auth/*, so /auth/callback now correctly
+          falls through to the SPA's static files. /auth/callback itself
+          is now exclusively the frontend's route - the backend never
+          owns it.
+Verified: Minted a real JWT on the live server, hit
+          https://meridianpixelated.duckdns.org/auth/callback?token=<jwt>
+          directly - landed on the real authenticated Overview page
+          (zero fabricated data - production DB was and is empty, so
+          every KPI/panel correctly showed its honest empty state).
+          Confirmed a genuinely fresh unauthenticated visit (localStorage
+          cleared) correctly shows Login. Deleted the throwaway
+          verification user afterward so production stays at 0 real
+          users until real Google OAuth login exists.
+
+Still blocked on going live for real users (unchanged from before this
+session, listed again here since this is the first time the live site
+actually serves the dashboard): real Google OAuth Client ID/Secret (both
+still literally "placeholder" in the live .env - needs the user's own
+Google Cloud Console setup), and SECRET_KEY on the live server is still
+the literal placeholder string "PASTE_YOUR_GENERATED_SECRET_HERE" rather
+than a real generated secret - JWTs are being signed with a known,
+publicly-visible string. Not exploitable by randoms today (no real user
+accounts exist to forge tokens for), but must be replaced with a real
+generated secret before any real user ever logs in.

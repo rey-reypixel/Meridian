@@ -29,7 +29,10 @@ class Settings(BaseSettings):
     # OAuth (Google)
     google_client_id: str = ""
     google_client_secret: str = ""
-    oauth_redirect_uri: str = "http://localhost:8000/auth/callback"
+    oauth_redirect_uri: str = "http://localhost:8000/auth/google/callback"
+    # Where /auth/callback redirects to after a successful login, with
+    # ?token=<jwt> appended - the frontend reads it and stores it.
+    frontend_url: str = "http://localhost:3000"
 
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:8000"]
