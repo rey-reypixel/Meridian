@@ -2,7 +2,7 @@
 
 **A self-hosted API that sits in front of Claude and automatically cuts cost per request** — via context truncation, model routing, semantic response caching, and batch processing.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
 
@@ -328,7 +328,13 @@ Contributions welcome — open an issue or a PR. Areas of particular interest:
 
 ## 📝 License
 
-MIT License — see [LICENSE](LICENSE)
+[Business Source License 1.1](LICENSE) — source-available, **not** open source.
+
+Free for non-production use: personal projects, evaluation, research, and teaching.
+**Any production or commercial use requires a paid commercial license.**
+On **2030-08-19** this version converts automatically to Apache License 2.0.
+
+Commercial and production licensing: **mahashreyaa@gmail.com**
 
 ---
 
